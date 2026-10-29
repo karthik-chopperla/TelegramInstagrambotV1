@@ -1,0 +1,1095 @@
+"""HikerAPI backend — concrete `OSINTBackend` over `hikerapi.AsyncClient`.
+
+Wraps the SDK so that:
+
+- HTTP errors propagate as typed `BackendError` subclasses (the SDK itself
+  swallows non-2xx responses; we install an httpx response hook that calls
+  `raise_for_status()` and an error translator that maps the httpx exception
+  to our taxonomy).
+- Quota headers (``x-quota-*`` / ``x-ratelimit-*``) are captured into
+  ``Quota`` on every response.
+- All SDK calls are wrapped with ``with_retry`` so ``RateLimited`` /
+  ``Transient`` are retried with backoff before propagating.
+- Each ``iter_*`` method is bounded by ``max_pages`` (default 1000) — a
+  defensive cap against unterminated cursors.
+- ``proxy`` is validated and threaded into a freshly-built
+  ``httpx.AsyncClient`` (the SDK's stock client has no proxy parameter).
+
+`hikerapi` is imported at module top-level — laziness is enforced one layer
+up, in `insto.backends.__init__.make_backend`, which only imports this
+module when `name == "hiker"`.
+"""
+
+from __future__ import annotations
+
+import time
+import urllib.parse
+from collections.abc import AsyncIterator, Awaitable, Callable
+from functools import partial
+from typing import Any, NoReturn, TypeVar, cast
+
+import hikerapi
+import httpx
+
+from insto.backends._base import OSINTBackend
+from insto.backends._hiker_map import (
+    map_comment,
+    map_highlight,
+    map_highlight_item,
+    map_post,
+    map_profile,
+    map_story,
+    map_user,
+)
+from insto.backends._retry import with_retry
+from insto.exceptions import (
+    AuthInvalid,
+    BackendError,
+    Banned,
+    PageBudgetExceeded,
+    PostNotFound,
+    ProfileNotFound,
+    QuotaExhausted,
+    RateLimited,
+    SchemaDrift,
+    Transient,
+)
+from insto.models import (
+    Comment,
+    Highlight,
+    HighlightItem,
+    Place,
+    Post,
+    Profile,
+    Quota,
+    Story,
+    User,
+)
+from insto.service.metrics import Metrics, MetricsSnapshot
+from insto.service.usage import UsageLedger
+
+T = TypeVar("T")
+
+DEFAULT_MAX_PAGES = 1000
+
+_QUOTA_REMAINING_HEADERS: tuple[str, ...] = ("x-quota-remaining", "x-ratelimit-remaining")
+_QUOTA_LIMIT_HEADERS: tuple[str, ...] = ("x-quota-limit", "x-ratelimit-limit")
+_QUOTA_RESET_HEADERS: tuple[str, ...] = ("x-quota-reset", "x-ratelimit-reset")
+# Headers that carry an absolute Unix timestamp at which the limit resets.
+# Different from `Retry-After`, which is a relative delay.
+_RESET_HEADERS: tuple[str, ...] = ("x-ratelimit-reset", "x-quota-reset")
+
+_VALID_PROXY_SCHEMES: frozenset[str] = frozenset({"http", "https", "socks5", "socks5h"})
+
+
+class _NotFoundError(BackendError):
+    """Internal 404 sentinel.
+
+    Re-raised at each public method as ``ProfileNotFound`` / ``PostNotFound``
+    with the right context (username / ref). Never escapes this module.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("not found")
+
+
+def _validate_proxy_url(url: str) -> None:
+    """Reject malformed proxy URLs *before* the SDK is ever constructed."""
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except (ValueError, TypeError) as exc:  # pragma: no cover - urlparse is robust
+        raise BackendError(f"invalid proxy URL: {url!r}") from exc
+    if parsed.scheme not in _VALID_PROXY_SCHEMES:
+        allowed = sorted(_VALID_PROXY_SCHEMES)
+        raise BackendError(f"invalid proxy URL {url!r}: scheme must be one of {allowed}")
+    if not parsed.hostname:
+        raise BackendError(f"invalid proxy URL {url!r}: missing host")
+
+
+def _parse_int_header(headers: httpx.Headers, names: tuple[str, ...]) -> int | None:
+    for name in names:
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _parse_retry_after(headers: httpx.Headers, *, now: float | None = None) -> float:
+    raw = headers.get("retry-after")
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    # `x-ratelimit-reset` / `x-quota-reset` are absolute Unix timestamps —
+    # convert to a relative delay so callers can sleep on it.
+    current = time.time() if now is None else now
+    for name in _RESET_HEADERS:
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            reset_at = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return max(0.0, reset_at - current)
+    return 60.0
+
+
+def _translate_http_status(exc: httpx.HTTPStatusError) -> BackendError:
+    status = exc.response.status_code
+    if status == 401:
+        return AuthInvalid("HikerAPI rejected the access token")
+    if status == 402:
+        return QuotaExhausted("HikerAPI quota exhausted")
+    if status == 403:
+        # HikerAPI proxies Instagram's HTTP status codes — 403 is what
+        # Instagram itself returns, not HikerAPI's plan / scope error.
+        # Typical causes:
+        #   1. The endpoint is login-walled (Instagram demands a session
+        #      cookie). Hiker has no cookie; aiograpi does.
+        #   2. The target's profile is region-restricted, age-gated, or
+        #      throttling third-party introspection.
+        # 401 stays the only "your HikerAPI access is wrong" signal.
+        # /info / /quota for other targets will keep working.
+        return Banned(
+            "Instagram returned 403 for this lookup (login-walled or "
+            "target-restricted). The hiker backend can't log in; this "
+            "endpoint will likely need the aiograpi backend. Other commands "
+            "and other targets should still work."
+        )
+    if status == 404:
+        return _NotFoundError()
+    if status == 429:
+        return RateLimited(retry_after=_parse_retry_after(exc.response.headers))
+    if 500 <= status < 600:
+        return Transient(f"HikerAPI server error {status}")
+    return BackendError(f"unexpected HikerAPI status {status}")
+
+
+def _extract_chunk(payload: Any) -> tuple[list[Any], str | None]:
+    """Return ``(items, next_cursor)`` from a HikerAPI chunk-endpoint response.
+
+    Hiker's chunk endpoints come back in one of these shapes (the SDK's own
+    paging helper handles all three, so we mirror it):
+
+    - ``[items, next_cursor]`` — a list of length 2.
+    - ``{"response": {"users"|"items"|"comments": [...], "next_max_id": ...}}``
+    - flat ``{"users"|"items"|"comments": [...], "next_max_id"|...: ...}``
+    """
+
+    if isinstance(payload, list) and len(payload) == 2:
+        raw_items, raw_cursor = payload
+        items = list(raw_items) if isinstance(raw_items, list) else []
+        cursor = _normalise_cursor(raw_cursor)
+        return items, cursor
+
+    if isinstance(payload, dict):
+        wrapped = payload.get("response")
+        inner: dict[str, Any] = wrapped if isinstance(wrapped, dict) else payload
+        items_out: list[Any] = []
+        for key in ("users", "items", "comments"):
+            candidate = inner.get(key)
+            if isinstance(candidate, list):
+                items_out = candidate
+                break
+        cursor_out: str | None = None
+        for key in ("next_max_id", "next_page_id", "end_cursor", "next_min_id"):
+            value = inner.get(key)
+            if value is None:
+                value = payload.get(key)
+            cursor_out = _normalise_cursor(value)
+            if cursor_out is not None:
+                break
+        return items_out, cursor_out
+
+    return [], None
+
+
+def _normalise_cursor(value: Any) -> str | None:
+    """Return `value` as a non-empty cursor string, or None.
+
+    Treats `None`, `False`, and the empty string as "no more pages",
+    but preserves the integer `0` (a legitimate first-page cursor on
+    some endpoints) — a plain truthiness check would silently
+    terminate pagination there. `False` is rejected because
+    `str(False) == "False"` would otherwise be re-fed as a literal
+    cursor string and loop until the page-cap aborts.
+    """
+
+    if value is None or value is False:
+        return None
+    text = str(value)
+    if text == "":
+        return None
+    return text
+
+
+def _map_place(loc: dict[str, Any]) -> Place:
+    """Map an IG ``location`` dict to a :class:`Place` DTO.
+
+    HikerAPI's ``fbsearch_places_v2`` returns ``{location: {...}, title,
+    subtitle}`` per item; we work off the inner ``location`` dict.
+    Required fields are ``pk`` and ``name`` — anything else is optional
+    (IG elides ``city`` / ``address`` for lesser-known places).
+    """
+    pk = loc.get("pk") or loc.get("id")
+    if pk is None:
+        raise SchemaDrift("fbsearch_places_v2", "pk")
+    name = loc.get("name")
+    if not name:
+        raise SchemaDrift("fbsearch_places_v2", "name")
+    fb_id = loc.get("facebook_places_id") or loc.get("external_id")
+    return Place(
+        pk=str(pk),
+        name=str(name),
+        address=str(loc.get("address") or ""),
+        city=str(loc.get("city") or ""),
+        short_name=str(loc.get("short_name") or ""),
+        lat=loc.get("lat"),
+        lng=loc.get("lng"),
+        facebook_id=str(fb_id) if fb_id else None,
+    )
+
+
+def _extract_single_list(payload: Any, *, keys: tuple[str, ...]) -> list[Any]:
+    """Return the items list from a non-paginated response.
+
+    The shape is normally one of:
+
+    - flat list ``[item, item, ...]``
+    - dict with one of ``keys`` mapping to the list
+    - dict wrapped under ``response``
+    """
+
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        wrapped = payload.get("response")
+        inner: dict[str, Any] = wrapped if isinstance(wrapped, dict) else payload
+        for key in keys:
+            value = inner.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+class HikerBackend(OSINTBackend):
+    """`OSINTBackend` backed by the HikerAPI SDK.
+
+    Tests inject a pre-built ``client`` — a ``hikerapi.AsyncClient`` whose
+    underlying ``httpx.AsyncClient`` uses ``MockTransport``. Production code
+    constructs its own from ``token`` (and optional ``proxy``).
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str | None = None,
+        timeout: float = 10.0,
+        proxy: str | None = None,
+        client: hikerapi.AsyncClient | None = None,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        retry_decorator: Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]
+        | None = None,
+        usage_ledger: UsageLedger | None = None,
+    ) -> None:
+        if proxy is not None:
+            _validate_proxy_url(proxy)
+        self._proxy = proxy
+        self._max_pages = max_pages
+
+        # When a proxy is configured we replace the SDK's auto-created
+        # `httpx.AsyncClient` with a proxied one. The original instance has
+        # never been used for a request, but its connection pool / file
+        # descriptors still need to be closed — track it so `aclose()` can
+        # release it deterministically.
+        self._discarded_client: httpx.AsyncClient | None = None
+        if client is None:
+            sdk = hikerapi.AsyncClient(token=token, timeout=timeout)
+            if proxy is not None:
+                proxied = httpx.AsyncClient(base_url=sdk._url, timeout=timeout, proxy=proxy)
+                proxied.headers.update(sdk._headers)
+                self._discarded_client = sdk._client
+                sdk._client = proxied
+            self._client: hikerapi.AsyncClient = sdk
+        else:
+            self._client = client
+
+        hooks = self._client._client.event_hooks.setdefault("response", [])
+        hooks.append(self._on_response)
+        self._usage_ledger = usage_ledger
+        self._client._client.event_hooks.setdefault("request", []).append(self._on_request)
+
+        self._apply_retry = retry_decorator if retry_decorator is not None else with_retry()
+        self._quota: Quota = Quota.unknown()
+        self._last_error: BaseException | None = None
+        self._drift_count: int = 0
+        self._metrics = Metrics()
+
+    def _record_drift(self, exc: SchemaDrift) -> SchemaDrift:
+        """Track a `SchemaDrift` for `/health`. Returns `exc` so callers can `raise`."""
+        self._drift_count += 1
+        self._last_error = exc
+        return exc
+
+    # ------------------------------------------------------------------ hooks
+
+    def install_usage_ledger(self, ledger: UsageLedger) -> None:
+        """Attach the profile's shared ledger without restarting this client."""
+        self._usage_ledger = ledger
+
+    async def _on_request(self, request: httpx.Request) -> None:
+        if self._usage_ledger is not None and request.url.path != "/sys/balance":
+            await self._usage_ledger.reserve()
+
+    async def _on_response(self, response: httpx.Response) -> None:
+        rem = _parse_int_header(response.headers, _QUOTA_REMAINING_HEADERS)
+        if rem is not None:
+            limit = _parse_int_header(response.headers, _QUOTA_LIMIT_HEADERS)
+            reset = _parse_int_header(response.headers, _QUOTA_RESET_HEADERS)
+            self._quota = Quota.with_remaining(rem, limit=limit, reset_at=reset)
+        if response.is_error:
+            await response.aread()
+            response.raise_for_status()
+
+    # ------------------------------------------------------------------ call
+
+    async def _call(self, factory: Callable[[], Awaitable[T]]) -> T:
+        """Invoke a single SDK call with retry + error translation.
+
+        Each invocation builds a fresh ``attempt`` so the retry state is
+        per-call, not shared across the backend.
+        """
+
+        @self._apply_retry
+        async def attempt() -> T:
+            try:
+                return await factory()
+            except httpx.HTTPStatusError as exc:
+                raise _translate_http_status(exc) from exc
+            except httpx.RequestError as exc:
+                raise Transient(f"HikerAPI network error: {exc}") from exc
+
+        # Wall-clock latency of the whole _call (including all retry
+        # waits). If the SDK retried 3x before succeeding, the latency
+        # reflects all of it — that's exactly what /health should show
+        # to flag a degraded backend.
+        start = time.monotonic()
+        try:
+            # `_apply_retry` is constructor-injected and erases its argument's
+            # generic to `Any`; cast back to `T` since `attempt`'s body is
+            # statically `Awaitable[T]`.
+            result = cast(T, await attempt())
+        except _NotFoundError:
+            # The internal sentinel — let the caller translate to a typed
+            # ProfileNotFound / PostNotFound *with context* and record that
+            # final error rather than the internal placeholder. NotFound is
+            # a normal answer ("user doesn't exist"), not a backend error,
+            # so we record it as a successful call for latency purposes.
+            self._metrics.record((time.monotonic() - start) * 1000.0, error=None)
+            raise
+        except BackendError as exc:
+            self._metrics.record((time.monotonic() - start) * 1000.0, error=exc)
+            self._last_error = exc
+            raise
+        self._metrics.record((time.monotonic() - start) * 1000.0, error=None)
+        return result
+
+    def _raise_not_found(self, mapped: BackendError, original: BaseException) -> NoReturn:
+        """Map an internal `_NotFoundError` to a public typed error and remember it."""
+
+        self._last_error = mapped
+        raise mapped from original
+
+    # ---------------------------------------------------------------- profile
+
+    async def resolve_target(self, username: str) -> str:
+        try:
+            payload = await self._call(lambda: self._client.user_by_username_v2(username=username))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(username), exc)
+        try:
+            user = self._unwrap_user(payload, endpoint="user_by_username_v2")
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+        pk = user.get("pk") or user.get("pk_id")
+        if not pk:
+            raise self._record_drift(SchemaDrift("user_by_username_v2", "pk"))
+        return str(pk)
+
+    async def get_profile_by_username(self, username: str) -> Profile:
+        """One request: `user_by_username_v2` carries the whole profile record.
+
+        Verified against a recorded answer (`tests/fixtures/hiker/
+        profile_by_username_v2.json`): every field `map_profile` reads is
+        present with the same value as `user_by_id_v2` returns for the same
+        account, so the second request bought nothing.
+        """
+        try:
+            payload = await self._call(lambda: self._client.user_by_username_v2(username=username))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(username), exc)
+        try:
+            user = self._unwrap_user(payload, endpoint="user_by_username_v2")
+            return map_profile(user)
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+
+    async def get_profile(self, pk: str) -> Profile:
+        try:
+            payload = await self._call(lambda: self._client.user_by_id_v2(id=pk))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+        try:
+            user = self._unwrap_user(payload, endpoint="user_by_id_v2")
+            return map_profile(user)
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+
+    async def get_user_about(self, pk: str) -> dict[str, Any]:
+        try:
+            payload = await self._call(lambda: self._client.user_about_v1(id=pk))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+        if not isinstance(payload, dict):
+            raise self._record_drift(SchemaDrift("user_about_v1", "user"))
+        return payload
+
+    @staticmethod
+    def _unwrap_user(payload: Any, *, endpoint: str) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            inner = payload.get("user")
+            if isinstance(inner, dict):
+                return inner
+            return payload
+        raise SchemaDrift(endpoint, "user")
+
+    # ----------------------------------------------------------- iter helpers
+
+    async def _iter_chunks(
+        self,
+        fetch: Callable[[str | None], Awaitable[Any]],
+        *,
+        endpoint: str,
+        limit: int | None,
+        mapper: Callable[[dict[str, Any]], T],
+    ) -> AsyncIterator[T]:
+        # Treat non-positive `limit` as "no limit". A literal `--limit 0` would
+        # otherwise yield exactly one item before the post-yield check fired —
+        # confusing semantics for a flag that callers reasonably read as "no
+        # cap". `/mutuals` translates 0 to its own sentinel before reaching us.
+        if limit is not None and limit <= 0:
+            limit = None
+        cursor: str | None = None
+        pages = 0
+        yielded = 0
+        while True:
+            if pages >= self._max_pages:
+                raise PageBudgetExceeded(endpoint, self._max_pages)
+            payload = await self._call(partial(fetch, cursor))
+            pages += 1
+            items, next_cursor = _extract_chunk(payload)
+            for raw in items:
+                if not isinstance(raw, dict):
+                    raise self._record_drift(SchemaDrift(endpoint, "item"))
+                try:
+                    mapped = mapper(raw)
+                except SchemaDrift as exc:
+                    raise self._record_drift(exc) from None
+                except (ValueError, TypeError) as exc:
+                    # Mapper int()/str() coercions can blow up on payloads that
+                    # technically have the right keys but the wrong shape (e.g.
+                    # `media_type` returned as the literal string "none"). Treat
+                    # these as schema drift rather than letting the iterator die.
+                    raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+                yield mapped
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    async def _iter_single_page(
+        self,
+        fetch: Callable[[], Awaitable[Any]],
+        *,
+        endpoint: str,
+        limit: int | None,
+        list_keys: tuple[str, ...],
+        mapper: Callable[[dict[str, Any]], T],
+    ) -> AsyncIterator[T]:
+        if limit is not None and limit <= 0:
+            limit = None
+        payload = await self._call(fetch)
+        items = _extract_single_list(payload, keys=list_keys)
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                raise self._record_drift(SchemaDrift(endpoint, "item"))
+            try:
+                mapped = mapper(raw)
+            except SchemaDrift as exc:
+                raise self._record_drift(exc) from None
+            except (ValueError, TypeError) as exc:
+                raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+            yield mapped
+            if limit is not None and index + 1 >= limit:
+                return
+
+    # ------------------------------------------------------------- iter_posts
+
+    async def iter_user_posts(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        async def fetch(cursor: str | None) -> Any:
+            return await self._client.user_medias_chunk_v1(user_id=pk, end_cursor=cursor)
+
+        try:
+            async for post in self._iter_chunks(
+                fetch, endpoint="user_medias_chunk_v1", limit=limit, mapper=map_post
+            ):
+                yield post
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def iter_user_followers(
+        self, pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[User]:
+        async def fetch(cursor: str | None) -> Any:
+            return await self._client.user_followers_chunk_v1(user_id=pk, max_id=cursor)
+
+        try:
+            async for user in self._iter_chunks(
+                fetch, endpoint="user_followers_chunk_v1", limit=limit, mapper=map_user
+            ):
+                yield user
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def iter_user_following(
+        self, pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[User]:
+        async def fetch(cursor: str | None) -> Any:
+            return await self._client.user_following_chunk_v1(user_id=pk, max_id=cursor)
+
+        try:
+            async for user in self._iter_chunks(
+                fetch, endpoint="user_following_chunk_v1", limit=limit, mapper=map_user
+            ):
+                yield user
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def iter_user_tagged(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        async def fetch(cursor: str | None) -> Any:
+            return await self._client.user_tag_medias_chunk_v1(user_id=pk, max_id=cursor)
+
+        try:
+            async for post in self._iter_chunks(
+                fetch, endpoint="user_tag_medias_chunk_v1", limit=limit, mapper=map_post
+            ):
+                yield post
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def iter_user_highlights(
+        self, pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[Highlight]:
+        try:
+            async for highlight in self._iter_single_page(
+                fetch=lambda: self._client.user_highlights_v2(user_id=pk),
+                endpoint="user_highlights_v2",
+                limit=limit,
+                list_keys=("highlights", "items", "tray"),
+                mapper=map_highlight,
+            ):
+                yield highlight
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def iter_highlight_items(
+        self, highlight_id: str, *, limit: int | None = None
+    ) -> AsyncIterator[HighlightItem]:
+        try:
+            payload = await self._call(lambda: self._client.highlight_by_id_v2(id=highlight_id))
+        except _NotFoundError as exc:
+            self._raise_not_found(PostNotFound(highlight_id), exc)
+
+        body: Any = payload
+        if isinstance(payload, dict):
+            inner = payload.get("highlight")
+            if isinstance(inner, dict):
+                body = inner
+        if not isinstance(body, dict):
+            raise self._record_drift(SchemaDrift("highlight_by_id_v2", "highlight"))
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise self._record_drift(SchemaDrift("highlight_by_id_v2", "items"))
+
+        mapper = partial(map_highlight_item, highlight_pk=str(highlight_id))
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                raise self._record_drift(SchemaDrift("highlight_by_id_v2", "item"))
+            try:
+                mapped = mapper(raw)
+            except SchemaDrift as exc:
+                raise self._record_drift(exc) from None
+            yield mapped
+            if limit is not None and index + 1 >= limit:
+                return
+
+    async def iter_post_comments(
+        self, media_pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[Comment]:
+        async def fetch(cursor: str | None) -> Any:
+            return await self._client.media_comments_chunk_v1(id=media_pk, max_id=cursor)
+
+        mapper = partial(map_comment, media_pk=str(media_pk))
+        try:
+            async for comment in self._iter_chunks(
+                fetch, endpoint="media_comments_chunk_v1", limit=limit, mapper=mapper
+            ):
+                yield comment
+        except _NotFoundError as exc:
+            self._raise_not_found(PostNotFound(media_pk), exc)
+
+    async def iter_post_likers(
+        self, media_pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[User]:
+        try:
+            async for user in self._iter_single_page(
+                fetch=lambda: self._client.media_likers_v1(id=media_pk),
+                endpoint="media_likers_v1",
+                limit=limit,
+                list_keys=("users", "items", "likers"),
+                mapper=map_user,
+            ):
+                yield user
+        except _NotFoundError as exc:
+            self._raise_not_found(PostNotFound(media_pk), exc)
+
+    async def iter_user_stories(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Story]:
+        try:
+            async for story in self._iter_single_page(
+                fetch=lambda: self._client.user_stories_v2(user_id=pk),
+                endpoint="user_stories_v2",
+                limit=limit,
+                list_keys=("stories", "items", "reels"),
+                mapper=map_story,
+            ):
+                yield story
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+
+    async def get_suggested(self, pk: str) -> list[User]:
+        try:
+            payload = await self._call(lambda: self._client.user_suggested_profiles_v2(user_id=pk))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+        items = _extract_single_list(payload, keys=("suggested", "users", "items"))
+        try:
+            return [map_user(raw) for raw in items if isinstance(raw, dict)]
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+
+    async def iter_hashtag_posts(
+        self, tag: str, *, limit: int | None = None
+    ) -> AsyncIterator[Post]:
+        # Hashtag responses don't fit the generic chunk shape `_extract_chunk`
+        # was written for. The payload looks like:
+        #   {"response": {"sections": [{"layout_content":
+        #       {"medias": [{"media": {...}}, ...]}}, ...],
+        #    "next_max_id": "...", "more_available": true},
+        #    "next_page_id": "WyJi..."}
+        # The real items are nested two levels deep, and the cursor that the
+        # endpoint accepts back is the *outer* `next_page_id` (a base64
+        # envelope), not the inner `next_max_id` (a hex string the server
+        # rejects with 400 if echoed back).
+        if limit is not None and limit <= 0:
+            limit = None
+        cursor: str | None = None
+        pages = 0
+        yielded = 0
+        endpoint = "hashtag_medias_recent_v2"
+        while True:
+            if pages >= self._max_pages:
+                raise PageBudgetExceeded(endpoint, self._max_pages)
+
+            async def fetch(c: str | None = cursor) -> Any:
+                return await self._client.hashtag_medias_recent_v2(name=tag, page_id=c)
+
+            try:
+                payload = await self._call(fetch)
+            except _NotFoundError as exc:
+                mapped = BackendError(f"hashtag not found: #{tag}")
+                self._last_error = mapped
+                raise mapped from exc
+            pages += 1
+            response = payload.get("response", {}) if isinstance(payload, dict) else {}
+            sections = response.get("sections", []) if isinstance(response, dict) else []
+            for section in sections:
+                medias = (section.get("layout_content") or {}).get("medias") or []
+                for entry in medias:
+                    raw = entry.get("media") if isinstance(entry, dict) else None
+                    if not isinstance(raw, dict):
+                        raise self._record_drift(SchemaDrift(endpoint, "media"))
+                    try:
+                        yield map_post(raw)
+                    except SchemaDrift as exc:
+                        raise self._record_drift(exc) from None
+                    except (ValueError, TypeError) as exc:
+                        raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+                    yielded += 1
+                    if limit is not None and yielded >= limit:
+                        return
+            next_cursor = _normalise_cursor(payload.get("next_page_id"))
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    async def iter_search_users(
+        self, query: str, *, limit: int | None = None
+    ) -> AsyncIterator[User]:
+        # `fbsearch_accounts_v2` returns the IG raw payload at the top level
+        # (no `response` envelope): `{users, has_more, page_token, ...}`.
+        # The cursor is named `page_token` (not `next_page_token`); that's
+        # the key both HikerAPI and aiograpi accept back as the kwarg name.
+        if limit is not None and limit <= 0:
+            limit = None
+        cursor: str | None = None
+        pages = 0
+        yielded = 0
+        endpoint = "fbsearch_accounts_v2"
+        while True:
+            if pages >= self._max_pages:
+                raise PageBudgetExceeded(endpoint, self._max_pages)
+
+            async def fetch(c: str | None = cursor) -> Any:
+                return await self._client.fbsearch_accounts_v2(query=query, page_token=c)
+
+            payload = await self._call(fetch)
+            pages += 1
+            users = payload.get("users") if isinstance(payload, dict) else None
+            if not isinstance(users, list):
+                raise self._record_drift(SchemaDrift(endpoint, "users"))
+            for raw in users:
+                if not isinstance(raw, dict):
+                    raise self._record_drift(SchemaDrift(endpoint, "user"))
+                try:
+                    yield map_user(raw)
+                except SchemaDrift as exc:
+                    raise self._record_drift(exc) from None
+                except (ValueError, TypeError) as exc:
+                    raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+            if not payload.get("has_more"):
+                return
+            next_cursor = _normalise_cursor(payload.get("page_token"))
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    async def iter_audio_clips(
+        self, track_id: str, *, limit: int | None = None
+    ) -> AsyncIterator[Post]:
+        # HikerAPI exposes two related audio endpoints:
+        #   - `track_stream_by_id_v2` — newer; returns `stream_rows[*].items`
+        #     where each `media` is a *preview* shape (only `pk`,
+        #     `media_type`, `image_versions2` — no `code` / `taken_at` /
+        #     `caption`). Cheap but unusable for `/audio` because the
+        #     command needs full Post DTOs.
+        #   - `track_by_id_v2` — older; returns `items[*].media` with
+        #     the complete media payload (`code`, `taken_at`, `caption`,
+        #     `clips_metadata`, owner block). What we want.
+        # Pagination cursor lives at top-level `next_page_id`.
+        if limit is not None and limit <= 0:
+            limit = None
+        cursor: str | None = None
+        pages = 0
+        yielded = 0
+        endpoint = "track_by_id_v2"
+        while True:
+            if pages >= self._max_pages:
+                raise PageBudgetExceeded(endpoint, self._max_pages)
+
+            async def fetch(c: str | None = cursor) -> Any:
+                return await self._client.track_by_id_v2(track_id=track_id, page_id=c)
+
+            payload = await self._call(fetch)
+            pages += 1
+            inner = payload.get("response") if isinstance(payload, dict) else None
+            items = (inner or {}).get("items") or []
+            for entry in items:
+                raw = entry.get("media") if isinstance(entry, dict) else None
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    yield map_post(raw)
+                except SchemaDrift as exc:
+                    raise self._record_drift(exc) from None
+                except (ValueError, TypeError) as exc:
+                    raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+            next_cursor = _normalise_cursor(payload.get("next_page_id"))
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    async def resolve_short_url(self, url: str) -> str:
+        # HikerAPI doesn't expose a generic HEAD-on-arbitrary-URL
+        # endpoint — its surface is Instagram-private only. Resolving
+        # `instagram.com/share/...` style short-links needs a real
+        # logged-in session, which only aiograpi has.
+        raise BackendError(
+            f"resolve {url!r}: HikerAPI has no short-URL resolver. "
+            "Switch to the aiograpi backend (which uses `public_head`)."
+        )
+
+    async def get_recommended(self, pk: str) -> list[User]:
+        # `discover/recommended_accounts_for_category/` is a logged-in
+        # surface (the IG app uses it for business profiles). Not
+        # exposed by HikerAPI's public OSINT API — needs aiograpi.
+        raise BackendError(
+            "/recommended needs the aiograpi backend "
+            "(category-recommendations require a logged-in session)."
+        )
+
+    # ------------------------------------------------------- pinned / reposts
+
+    async def iter_user_pinned(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        # `user_medias_pinned_v1` returns the pinned posts as a *list*
+        # directly (no envelope). Each item is a full media dict.
+        # Instagram caps pinned posts at 3 per profile; pagination is
+        # not meaningful here, so a single call covers it.
+        try:
+            payload = await self._call(lambda: self._client.user_medias_pinned_v1(user_id=pk))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(pk), exc)
+        items = payload if isinstance(payload, list) else []
+        endpoint = "user_medias_pinned_v1"
+        for yielded, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise self._record_drift(SchemaDrift(endpoint, "item"))
+            try:
+                yield map_post(raw)
+            except SchemaDrift as exc:
+                raise self._record_drift(exc) from None
+            except (ValueError, TypeError) as exc:
+                raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+            if limit is not None and yielded >= limit:
+                return
+
+    async def iter_user_reposts(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        # `user_reposts_gql(flat=True)` returns
+        # ``{items: [media_dict, ...], more_available: bool, max_id: ...}``.
+        # The cursor kwarg is ``repost_next_max_id``.
+        if limit is not None and limit <= 0:
+            limit = None
+        cursor: str | None = None
+        pages = 0
+        yielded = 0
+        endpoint = "user_reposts_gql"
+        while True:
+            if pages >= self._max_pages:
+                raise PageBudgetExceeded(endpoint, self._max_pages)
+
+            async def fetch(c: str | None = cursor) -> Any:
+                return await self._client.user_reposts_gql(
+                    user_id=pk, repost_next_max_id=c, flat=True
+                )
+
+            payload = await self._call(fetch)
+            pages += 1
+            if not isinstance(payload, dict):
+                return
+            items = payload.get("items") or []
+            for raw in items:
+                if not isinstance(raw, dict):
+                    raise self._record_drift(SchemaDrift(endpoint, "item"))
+                try:
+                    yield map_post(raw)
+                except SchemaDrift as exc:
+                    raise self._record_drift(exc) from None
+                except (ValueError, TypeError) as exc:
+                    raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+            if not payload.get("more_available"):
+                return
+            next_cursor = _normalise_cursor(payload.get("max_id"))
+            if not next_cursor:
+                return
+            cursor = next_cursor
+
+    # ----------------------------------------------------------- /postinfo
+
+    async def get_post_by_ref(self, ref: str) -> Post:
+        # Detect the input form: full URL → media_by_url_v1; bare digits
+        # → media_by_id_v1; otherwise treat as shortcode →
+        # media_by_code_v1. The three return the same payload shape so
+        # `map_post` handles all of them.
+        cleaned = ref.strip()
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            fetcher = lambda: self._client.media_by_url_v1(url=cleaned)  # noqa: E731
+            endpoint = "media_by_url_v1"
+        elif cleaned.isdigit():
+            fetcher = lambda: self._client.media_by_id_v1(id=cleaned)  # noqa: E731
+            endpoint = "media_by_id_v1"
+        else:
+            # Shortcode — the IG `code` parameter. May include a leading
+            # `/p/` if the user copy-pasted the path; strip defensively.
+            code = cleaned.strip("/").rsplit("/", 1)[-1]
+            fetcher = lambda: self._client.media_by_code_v1(code=code)  # noqa: E731
+            endpoint = "media_by_code_v1"
+        try:
+            payload = await self._call(fetcher)
+        except _NotFoundError as exc:
+            self._raise_not_found(PostNotFound(ref), exc)
+        try:
+            return map_post(payload)
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+        except (ValueError, TypeError) as exc:
+            raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+
+    # ---------------------------------------------------------------- /place
+
+    async def search_places(self, query: str, *, limit: int = 20) -> list[Place]:
+        # `fbsearch_places_v2` returns
+        # ``{items: [{location: {pk, name, lat, lng, ...}, title, subtitle}, ...]}``.
+        # The wrapper carries title/subtitle for IG's display; the
+        # ``location`` dict is the canonical shape we map.
+        payload = await self._call(lambda: self._client.fbsearch_places_v2(query=query))
+        if not isinstance(payload, dict):
+            return []
+        items = payload.get("items") or []
+        out: list[Place] = []
+        for entry in items[:limit]:
+            loc = entry.get("location") if isinstance(entry, dict) else None
+            if not isinstance(loc, dict):
+                continue
+            try:
+                out.append(_map_place(loc))
+            except SchemaDrift as exc:
+                raise self._record_drift(exc) from None
+        return out
+
+    async def iter_place_posts(
+        self, place_pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[Post]:
+        # `location_medias_top_v1(location_pk: int, amount)` returns a
+        # **list** of media dicts directly (no envelope). amount is the
+        # per-call cap. Pagination beyond a single call is not exposed
+        # by the SDK; the IG endpoint has its own server-side cap.
+        amount = int(limit) if limit and limit > 0 else 50
+        try:
+            pk_int = int(place_pk)
+        except (ValueError, TypeError) as exc:
+            raise BackendError(f"invalid place pk: {place_pk!r}") from exc
+        payload = await self._call(
+            lambda: self._client.location_medias_top_v1(location_pk=pk_int, amount=amount)
+        )
+        items = payload if isinstance(payload, list) else []
+        endpoint = "location_medias_top_v1"
+        yielded = 0
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                yield map_post(raw)
+            except SchemaDrift as exc:
+                raise self._record_drift(exc) from None
+            except (ValueError, TypeError) as exc:
+                raise self._record_drift(SchemaDrift(endpoint, str(exc))) from None
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
+
+    # -------------------------------------------------------------- bookkeeping
+
+    def get_quota(self) -> Quota:
+        return self._quota
+
+    async def validate_access(self) -> Quota:
+        """Confirm access using a strictly validated `/sys/balance` response."""
+
+        async def request_balance() -> httpx.Response:
+            try:
+                response = cast(httpx.Response, await self._client._client.get("/sys/balance"))
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (403, 404):
+                    # Balance failures are not Instagram profile lookup errors.
+                    raise BackendError("HikerAPI access check could not confirm access") from None
+                raise
+
+        response = await self._call(request_balance)
+        try:
+            data = response.json()
+        except ValueError:
+            raise self._record_drift(SchemaDrift("/sys/balance", "valid JSON object")) from None
+        remaining = data.get("requests") if isinstance(data, dict) else None
+        if type(remaining) is not int or remaining < 0:
+            raise self._record_drift(SchemaDrift("/sys/balance", "nonnegative integer requests"))
+        self._quota = Quota.with_remaining(remaining)
+        return self._quota
+
+    async def refresh_quota(self) -> Quota:
+        """Pull the current balance from `/sys/balance` and update `_quota`.
+
+        HikerAPI is pay-per-call, not a fixed N/100 quota. The balance
+        endpoint returns:
+          - ``requests``: total remaining requests on the current plan
+          - ``rate``: per-second rate limit
+          - ``amount`` / ``currency``: dollar balance
+
+        Per-response headers occasionally don't include quota info, so the
+        BottomToolbar would otherwise stay "unknown" forever. This method
+        is called once at REPL/CLI bootstrap so the user sees real numbers.
+        Failures are swallowed (returns the previous `_quota`); this never
+        kills the session.
+        """
+        try:
+            response = await self._client._client.get("/sys/balance")
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return self._quota
+        remaining = data.get("requests")
+        if isinstance(remaining, int):
+            self._quota = Quota.with_remaining(
+                remaining,
+                limit=None,
+                reset_at=None,
+                rate=data.get("rate"),
+                amount=data.get("amount"),
+                currency=data.get("currency"),
+            )
+        return self._quota
+
+    def get_last_error(self) -> BaseException | None:
+        return self._last_error
+
+    def get_schema_drift_count(self) -> int:
+        return self._drift_count
+
+    def get_metrics(self) -> MetricsSnapshot:
+        return self._metrics.snapshot()
+
+    async def aclose(self) -> None:
+        """Close the underlying SDK client."""
+
+        await self._client.aclose()
+        if self._discarded_client is not None:
+            await self._discarded_client.aclose()
+            self._discarded_client = None

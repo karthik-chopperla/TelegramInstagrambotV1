@@ -1,0 +1,552 @@
+# Changelog
+
+All notable changes to insto. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/spec/v2.0.0.html). Entries from 0.1.1 onward will be assembled from Conventional Commits by [release-please](https://github.com/googleapis/release-please).
+
+## 0.7.25 (2026-10-13)
+
+### Added
+
+* Desktop activity includes a Monday-first 7-by-24 UTC posting heatmap from the same fetched posts.
+* Local daily request-attempt inspection and optional ceilings shared by desktop lookups and the watch runtime, including atomic reservations and live cap changes.
+
+### Fixed
+
+* Home path validation consistently rejects symlink loops on Python 3.13.
+
+## [0.7.24](https://github.com/subzeroid/insto/compare/v0.7.23...v0.7.24) (2026-10-09)
+
+
+### Added
+
+* **desktop:** read a looked-up profile in one request ([8082161](https://github.com/subzeroid/insto/commit/8082161964f565a2eb35f7b4e9c5816d4b32ce03))
+* **desktop:** read a looked-up profile in one request ([19fac39](https://github.com/subzeroid/insto/commit/19fac39bfb75f65454f25d8349894f059b7225be))
+* **desktop:** report posts published between two saved snapshots ([1654ad8](https://github.com/subzeroid/insto/commit/1654ad8296c6bbe414f9377382bff28b8d295a7e))
+
+
+### Fixed
+
+* **desktop:** keep impossible coordinates and radii off the lookup wire ([c140466](https://github.com/subzeroid/insto/commit/c140466ac2049c4c4e883968cb36c29df1dd8b89))
+* **desktop:** keep impossible coordinates and radii off the lookup wire ([3f64d40](https://github.com/subzeroid/insto/commit/3f64d40f7678815219e2b57ed125ffce54fd7c93))
+
+## [0.7.23](https://github.com/subzeroid/insto/compare/v0.7.22...v0.7.23) (2026-09-21)
+
+
+### Added
+
+* **backends:** let a caller refuse rate-limit retries ([933df32](https://github.com/subzeroid/insto/commit/933df3283b479f0a38f6d66fb8805a4850cc35b8))
+* **desktop:** add the lookup.profile and lookup.activity reads ([5dfdc33](https://github.com/subzeroid/insto/commit/5dfdc33e9592439f13903d44a22d96a7b7f61050))
+* **desktop:** add the snapshots.read operation ([86862bf](https://github.com/subzeroid/insto/commit/86862bf340c1117729426c7859cb5d3ca770c342))
+* **desktop:** lookup.profile and lookup.activity ([e871ea3](https://github.com/subzeroid/insto/commit/e871ea3e207cb78891b812480aa0a092d02d8402))
+* **desktop:** prompt first check in the headless daemon and snapshots.read ([51103f2](https://github.com/subzeroid/insto/commit/51103f275ea1ac1881f7aacef76f9ba685334890))
+* **service:** check a new registration right away in the headless daemon ([3ed449a](https://github.com/subzeroid/insto/commit/3ed449ab18f158697382b0039e935135f9d4e28e))
+
+
+### Fixed
+
+* **desktop:** cap the paid page requests one lookup can make ([56f2d35](https://github.com/subzeroid/insto/commit/56f2d3513f456aa48123ac697ea9dffc3eee7280))
+* **desktop:** stop calling a bare provider 403 a private account ([2c782bb](https://github.com/subzeroid/insto/commit/2c782bbb1c43c69005bdd5f63136782945526d3e))
+* **history:** identify media by path segment, not the signed CDN URL ([8aa118d](https://github.com/subzeroid/insto/commit/8aa118d1c3fd78ecc767c67872cae59ab941e6f6))
+* **history:** stop reporting a profile-picture change on every check ([2dc187a](https://github.com/subzeroid/insto/commit/2dc187a905a0620bfc322a08bb66d380a5c07df7))
+* **history:** tag each snapshot with the algorithm that hashed its media ([3f3800a](https://github.com/subzeroid/insto/commit/3f3800aa09bfb88648c8d367c20a2721d07326f7))
+* **service:** grant the immediate first check once per registration ([b4eb0b3](https://github.com/subzeroid/insto/commit/b4eb0b386c03a0e7ea044f442b523040df33f883))
+
+
+### Documentation
+
+* describe the lookup operations and the network read budget ([1144139](https://github.com/subzeroid/insto/commit/11441392100eb9f89ec5c89ca22535e179788e6c))
+* describe the per-row media-hash algorithm and ungated reads ([66c4dff](https://github.com/subzeroid/insto/commit/66c4dff4ba43edd68360c56a10b06e3eafadbea4))
+* rewrap the lookup.profile paragraph ([7ba6a9d](https://github.com/subzeroid/insto/commit/7ba6a9d13d9c4eb92b12c4a0515599a66694be8d))
+* rewrap the snapshots.read and changes.list paragraphs ([978422c](https://github.com/subzeroid/insto/commit/978422c901412e8fd281aa4395ef1ff70de99f59))
+* say what avatar and banner change detection compares ([310cd18](https://github.com/subzeroid/insto/commit/310cd1832534d28bbc512b9d78e4eb41c5912237))
+* state the lookup request ceilings, the new codes and the activity gate ([3aca34f](https://github.com/subzeroid/insto/commit/3aca34f8fe134062d62a0ee8ca1477eb3e8b75da))
+
+## [0.7.22](https://github.com/subzeroid/insto/compare/v0.7.21...v0.7.22) (2026-09-06)
+
+
+### Added
+
+* adopt existing homes and migrate the desktop service ([#59](https://github.com/subzeroid/insto/issues/59)) ([d36a3fd](https://github.com/subzeroid/insto/commit/d36a3fd55f2a5991d74716772b4b821bc7851b23))
+
+## [0.7.21](https://github.com/subzeroid/insto/compare/v0.7.20...v0.7.21) (2026-09-05)
+
+
+### Added
+
+* add bounded owned watch service lifecycle lease ([9f2962c](https://github.com/subzeroid/insto/commit/9f2962c09073e158edfc95f171c50bdc2b0f81b9))
+* add bounded side-effect-free desktop handshake ([544137a](https://github.com/subzeroid/insto/commit/544137a2458b1dbb045294db87bfccb5d039b06b))
+* add macOS watcher service lifecycle ([604c680](https://github.com/subzeroid/insto/commit/604c6806706dde481e2257f83e957a5b3900ab6f))
+* bound and validate saved snapshot records ([e62cf8f](https://github.com/subzeroid/insto/commit/e62cf8fb814c3a97341d1d37d1f024a4ddf9947f))
+* **desktop:** add bounded managed database transactions ([bab03e5](https://github.com/subzeroid/insto/commit/bab03e59b810dd58ed03686bef827ca2e7a90840))
+* **desktop:** add durable setup and credential recovery transactions ([06c4424](https://github.com/subzeroid/insto/commit/06c442433cbc8866f981eb060a5d8fabee0aee9b))
+* **desktop:** add private crash-safe profile storage ([6d4802d](https://github.com/subzeroid/insto/commit/6d4802d73dcf736e2b659c029f82d275be190bc5))
+* **desktop:** add safe watch commands and bounded overview ([b0bf64b](https://github.com/subzeroid/insto/commit/b0bf64b50882e29831c841193611b703eb6f81bb))
+* **desktop:** expose revision-safe watch protocol ([85a8a98](https://github.com/subzeroid/insto/commit/85a8a988d046eb3d181e006eeba9e8a8379278cd))
+* **desktop:** expose strict setup and service operations ([4a8b452](https://github.com/subzeroid/insto/commit/4a8b45237d799c037a9820a975e52003ad1403ef))
+* expose bounded saved history desktop operations ([cf294cb](https://github.com/subzeroid/insto/commit/cf294cb1ebbe25bc7be03770554dfabe1846fe07))
+* route saved history desktop capabilities ([94b9acc](https://github.com/subzeroid/insto/commit/94b9acc0a208d939d8e0b7db6a34e0599225a545))
+* stream saved snapshot keyset queries ([7f89a1f](https://github.com/subzeroid/insto/commit/7f89a1fb0cc380cdb5ec615a8852ce9fcb636b4a))
+* support bytecode-free managed service launches safely ([b66cf5e](https://github.com/subzeroid/insto/commit/b66cf5e9f2085b0a69b2bafa125a3bf2cf56fef5))
+* validate desktop credentials with isolated transport ([e266f6e](https://github.com/subzeroid/insto/commit/e266f6ee61fe9da9b18762f4ad7035c08ca0d10f))
+* validate desktop saved history parameters ([049523d](https://github.com/subzeroid/insto/commit/049523d5af714035c94673647273f2529f974e0b))
+* validate HikerAPI access without swallowing failures ([709619c](https://github.com/subzeroid/insto/commit/709619c979409db4352f17e11f4b63abd20443f1))
+* **watch:** share registration transactions and fence desktop mutations ([2a535a3](https://github.com/subzeroid/insto/commit/2a535a3b691f44e52531bba9746fbc25fbaa83d8))
+
+
+### Fixed
+
+* **desktop:** bind resumed setup quota to validated candidate ([6c1687c](https://github.com/subzeroid/insto/commit/6c1687c06ecf74be83030691bbcd1691bc43a64e))
+* **desktop:** bound request and client cancellation waits ([deeb682](https://github.com/subzeroid/insto/commit/deeb682528334869ac2fdddb2c558bbdffc86e49))
+* **desktop:** preserve service disposition after orphan cleanup ([0c9682a](https://github.com/subzeroid/insto/commit/0c9682ad290c2a8d124b4ce36442c76e7ed54faf))
+* **desktop:** reject orphan SQLite sidecars before setup ([ce57522](https://github.com/subzeroid/insto/commit/ce57522af438695f3fbce74ca8166eb158432e54))
+* observe owned readiness after kickstart timeout ([ec2d5dc](https://github.com/subzeroid/insto/commit/ec2d5dcf4da87680f5c5cdf2a5b83db682809109))
+* parse only unambiguous outer launchctl job fields ([89ea23b](https://github.com/subzeroid/insto/commit/89ea23bde9a77e1a7cd70078e819a5f7d0fba3e9))
+* **service:** recognize verified native startup transitions ([aedab74](https://github.com/subzeroid/insto/commit/aedab744ea0123c8e01ab63fec9b9ca7be93a0a7))
+* **service:** wait for executor PID publication at startup ([44c268b](https://github.com/subzeroid/insto/commit/44c268b35af51fc94c4de6d84b1e3dc5a72de2e7))
+* **service:** wait through native termination transition ([7fdb54c](https://github.com/subzeroid/insto/commit/7fdb54ca34fc70d0168a83b2b2bd8af84af904fa))
+
+
+### Documentation
+
+* approve and review macOS service implementation plan ([8879c9a](https://github.com/subzeroid/insto/commit/8879c9af31e0785002d93ca742b92abe95109fbf))
+* complete engineering review of insto-gui plans ([b573ddf](https://github.com/subzeroid/insto/commit/b573ddf46775780c3cc6c69c50a41da7f841dfcd))
+* **desktop:** record the approved C2 read-only contract ([e38a923](https://github.com/subzeroid/insto/commit/e38a9231cbda614a37add5f58aaa57832aa0e62b))
+* **desktop:** record verified C1 setup and native recovery ([ac099be](https://github.com/subzeroid/insto/commit/ac099be78520573dc0581c47a330b9ff8cab34ff))
+* document bounded desktop saved history ([36d69b6](https://github.com/subzeroid/insto/commit/36d69b6cbf61e7250e1db8af402930662a3b1f4a))
+* draft macOS watch service design ([51e6b8d](https://github.com/subzeroid/insto/commit/51e6b8daba21c538f5cbb852c545abc53ccdc8ab))
+* plan desktop foundation and standalone runtime proof ([059d5e9](https://github.com/subzeroid/insto/commit/059d5e98611eebd82e6fb638e7a4260ef19b8284))
+* plan desktop setup and credential recovery ([5fc1d92](https://github.com/subzeroid/insto/commit/5fc1d92a475d8f7e240a0d295d498c32993527cd))
+* record verified desktop foundation and packaging handoff ([d0c727a](https://github.com/subzeroid/insto/commit/d0c727a2bf11c9a0c0c9d1719b7c0003514d287b))
+* specify self-contained insto GUI onboarding ([5f7ab08](https://github.com/subzeroid/insto/commit/5f7ab087f6b4896704accc005ba9ac12d98e6a11))
+
+## [0.7.20](https://github.com/subzeroid/insto/compare/v0.7.19...v0.7.20) (2026-09-04)
+
+
+### Fixed
+
+* harden watcher shutdown and daemon maintenance ([#56](https://github.com/subzeroid/insto/issues/56)) ([157ecef](https://github.com/subzeroid/insto/commit/157ecef94d16ab22503b7c3aac855cbadf854129))
+
+## [0.7.19](https://github.com/subzeroid/insto/compare/v0.7.18...v0.7.19) (2026-09-04)
+
+
+### Added
+
+* add watch webhook notifications ([#54](https://github.com/subzeroid/insto/issues/54)) ([328fe9f](https://github.com/subzeroid/insto/commit/328fe9f37a1580888122263454a40d06e292ef8c))
+
+## [0.7.18](https://github.com/subzeroid/insto/compare/v0.7.17...v0.7.18) (2026-09-04)
+
+
+### Added
+
+* add persistent watch daemon ([#52](https://github.com/subzeroid/insto/issues/52)) ([41c9616](https://github.com/subzeroid/insto/commit/41c9616191c7efcea528c033975f5a4faceef1b2))
+
+## [0.7.17](https://github.com/subzeroid/insto/compare/v0.7.16...v0.7.17) (2026-06-20)
+
+
+### Documentation
+
+* **roadmap:** record live /info e2e + CI live-test job ([#51](https://github.com/subzeroid/insto/issues/51)) ([890f199](https://github.com/subzeroid/insto/commit/890f1990d3c6536f8dc73ccf84dc1db1da3c305d))
+* **test:** clarify e2e proxy default reasoning ([#49](https://github.com/subzeroid/insto/issues/49)) ([9f2c12b](https://github.com/subzeroid/insto/commit/9f2c12b0517abb27ccd31b44ace1a1c5e8d59dee))
+
+## [0.7.16](https://github.com/subzeroid/insto/compare/v0.7.15...v0.7.16) (2026-06-20)
+
+
+### Fixed
+
+* **aiograpi:** generate 6-digit TOTP code instead of submitting raw seed ([#46](https://github.com/subzeroid/insto/issues/46)) ([6914012](https://github.com/subzeroid/insto/commit/6914012e2def20bf1d42ccb5c82aa5c5bb001807)), closes [#45](https://github.com/subzeroid/insto/issues/45)
+
+## [0.7.15](https://github.com/subzeroid/insto/compare/v0.7.14...v0.7.15) (2026-06-01)
+
+
+### Fixed
+
+* warn when aiograpi setup lacks dependency ([#43](https://github.com/subzeroid/insto/issues/43)) ([cd391fc](https://github.com/subzeroid/insto/commit/cd391fcae8de9a9bdb557814b4af404571a1a80b))
+
+## [0.7.14](https://github.com/subzeroid/insto/compare/v0.7.13...v0.7.14) (2026-05-31)
+
+
+### Documentation
+
+* refresh release documentation for v0.7.13 ([#38](https://github.com/subzeroid/insto/issues/38)) ([95e607c](https://github.com/subzeroid/insto/commit/95e607c03ae83db03243acb9acc49c2f6eb6072b))
+
+## [0.7.13](https://github.com/subzeroid/insto/compare/v0.7.12...v0.7.13) (2026-05-28)
+
+
+### Fixed
+
+* clarify hikerapi setup prompts and aiograpi install hints ([#37](https://github.com/subzeroid/insto/issues/37)) ([0ed435a](https://github.com/subzeroid/insto/commit/0ed435ad9ff81daccc706f10845dee58ca7193d1))
+
+
+### Documentation
+
+* actualize REPL docs for startup target, themes, picker, shortcuts ([#35](https://github.com/subzeroid/insto/issues/35)) ([b16cbe9](https://github.com/subzeroid/insto/commit/b16cbe99f3f5fab925efeeeb163ed4b9143fc35c))
+
+## [0.7.12](https://github.com/subzeroid/insto/compare/v0.7.11...v0.7.12) (2026-05-27)
+
+
+### Added
+
+* interactive theme picker with live banner preview ([#32](https://github.com/subzeroid/insto/issues/32)) ([d2ef14f](https://github.com/subzeroid/insto/commit/d2ef14ff0961c80b0a6292ba16b8ba9010146f2f))
+* per-theme descriptions + accent colour in /theme completion ([#34](https://github.com/subzeroid/insto/issues/34)) ([9335457](https://github.com/subzeroid/insto/commit/9335457e7510e43e8db44f62420745df0114417b))
+
+## [0.7.11](https://github.com/subzeroid/insto/compare/v0.7.10...v0.7.11) (2026-05-27)
+
+
+### Added
+
+* group /help output by command category ([#28](https://github.com/subzeroid/insto/issues/28)) ([218f3f8](https://github.com/subzeroid/insto/commit/218f3f8a65c8f731976acf704f1be40ad18dbef4))
+
+
+### Documentation
+
+* document /theme, startup target, and REPL shortcuts ([#30](https://github.com/subzeroid/insto/issues/30)) ([ae63cf6](https://github.com/subzeroid/insto/commit/ae63cf62e8fed45bdeb183d48de639c58f1f8834))
+
+## [0.7.10](https://github.com/subzeroid/insto/compare/v0.7.9...v0.7.10) (2026-05-27)
+
+
+### Added
+
+* add hacker, amber, and cyberpunk colour themes ([#25](https://github.com/subzeroid/insto/issues/25)) ([1350fd2](https://github.com/subzeroid/insto/commit/1350fd2cc11de89f05b49bc814ba19e84122c07c))
+
+## [0.7.9](https://github.com/subzeroid/insto/compare/v0.7.8...v0.7.9) (2026-05-27)
+
+
+### Added
+
+* apply /theme live and show hotkeys in the welcome banner ([#22](https://github.com/subzeroid/insto/issues/22)) ([6819fc0](https://github.com/subzeroid/insto/commit/6819fc0525c1bc5c92075d63e48599568aa99be5))
+
+## [0.7.8](https://github.com/subzeroid/insto/compare/v0.7.7...v0.7.8) (2026-05-27)
+
+
+### Added
+
+* select startup target and show it in the welcome banner ([#20](https://github.com/subzeroid/insto/issues/20)) ([8090084](https://github.com/subzeroid/insto/commit/80900844e4f4b4da93122c1c36d0f5448b955a4e))
+
+
+### Fixed
+
+* align /help columns and stop eating optional-arg brackets ([#21](https://github.com/subzeroid/insto/issues/21)) ([300dd68](https://github.com/subzeroid/insto/commit/300dd6877532fcbc077d4456662bc747c1308427))
+
+
+### Documentation
+
+* sync watch daemon documentation ([#18](https://github.com/subzeroid/insto/issues/18)) ([23041b6](https://github.com/subzeroid/insto/commit/23041b669b2537b91a0f5963b0b335262e5d1f73))
+
+## [0.7.7](https://github.com/subzeroid/insto/compare/v0.7.6...v0.7.7) (2026-05-15)
+
+
+### Documentation
+
+* defer personal feed surface ([#16](https://github.com/subzeroid/insto/issues/16)) ([3423d1f](https://github.com/subzeroid/insto/commit/3423d1f6c47e7c2cf311fefc0077836eeab1bb71))
+
+## [0.7.6](https://github.com/subzeroid/insto/compare/v0.7.5...v0.7.6) (2026-05-15)
+
+
+### Added
+
+* add read-only saved commands ([#11](https://github.com/subzeroid/insto/issues/11)) ([39566d3](https://github.com/subzeroid/insto/commit/39566d39bda660917771029246c52e4ddf6def36))
+
+## [0.7.5](https://github.com/subzeroid/insto/compare/v0.7.4...v0.7.5) (2026-05-15)
+
+
+### Added
+
+* filter Direct threads by participant ([31770ff](https://github.com/subzeroid/insto/commit/31770ffd55ccae07d4dc2fb7a2aef91d7545c305))
+
+## [0.7.4](https://github.com/subzeroid/insto/compare/v0.7.3...v0.7.4) (2026-05-15)
+
+
+### Added
+
+* add read-only aiograpi direct commands ([a3ad550](https://github.com/subzeroid/insto/commit/a3ad550f4eb082e3662657f038d7f67820005a15))
+
+
+### Fixed
+
+* repair release-please version updater ([80b0e5c](https://github.com/subzeroid/insto/commit/80b0e5c0f34983201f65aa5b608142d0d467d496))
+
+
+### Documentation
+
+* refresh aiograpi roadmap ([#3](https://github.com/subzeroid/insto/issues/3)) ([d98d9f7](https://github.com/subzeroid/insto/commit/d98d9f7bc9cecd38aa71f6cb9df458c8b2894bca))
+* update hiker links and home demo ([62bc540](https://github.com/subzeroid/insto/commit/62bc5407bc4ce3a6c99b60b0d0005fb56b859016))
+
+## [0.7.3](https://github.com/subzeroid/insto/compare/v0.7.2...v0.7.3) (2026-04-29)
+
+
+### Documentation
+
+* HikerAPI free-trial promo link (100 requests, no card) ([a1bbaed](https://github.com/subzeroid/insto/commit/a1bbaedd71f10c2b39bc05c68a31662f07d67c64))
+
+## [0.7.2](https://github.com/subzeroid/insto/compare/v0.7.1...v0.7.2) (2026-04-29)
+
+
+### Documentation
+
+* OSINT recipes page — 7 multi-step investigative scenarios ([e776d4c](https://github.com/subzeroid/insto/commit/e776d4c2c754dc29f13d2105610812f48766216d))
+* refresh demo.gif (/info + /where + /fans) + Killer features page ([df556b0](https://github.com/subzeroid/insto/commit/df556b04f193754a8e99f8e013917224a568cb9d))
+
+## [0.7.1] - 2026-04-29
+
+### Added
+
+- **`/where <user>` 🔥** — geo-fingerprint analytic. Walks the target's recent posts, extracts GPS coordinates from every geotag, computes the **anchor** (most-frequent place — proxy for "where they live or work"), the **centroid** (arithmetic mean of all geotag points), and the **spread radius** (max haversine distance from centroid). Top-N places rendered as a horizontal bar chart. On @ferrari (15/30 posts geotagged): anchor = Maranello (47%), centroid in N. Italy, max radius 9.5k km — Maranello is HQ, the rest is racing circuits and ski trips.
+- **`Post.location_lat` / `Post.location_lng`** fields. The IG payload always carried these but the mappers were dropping them. Now extracted by both backends; new `_opt_float` helper handles NaN / coercion errors. Snapshot serialisation is unaffected (snapshot diff already serialised the whole Post via `dataclasses.asdict`).
+
+### Changed
+
+- Command surface table in the README marks **🔥 killer-feature commands** so newcomers can immediately spot the OSINT-unique primitives (`/dossier`, `/where`, `/intersect`, `/fans`, `/place`, `/placeposts`, `/postinfo`, `/search`, `/timeline`) vs the trivial wrappers.
+- `/locations` moved from "Content" group to a new "Geo" group alongside `/where`, `/place`, `/placeposts` — they all answer "where" rather than "what about the captions".
+
+## [0.7.0] - 2026-04-29
+
+### Added — five new OSINT commands
+
+- **`/place <query>`** — search Instagram places by free text (e.g. `Tbilisi`, `Eiffel Tower`). Returns matched locations with name + GPS + IG location pk, plus a hint to `/placeposts` for posts at that place. CSV / JSON / Maltego (`maltego.GPS`) export.
+- **`/placeposts <pk>`** — top posts at a given Instagram location pk. Reveals who, what, when at a place — the geo-OSINT primitive. Pairs with `/place` to find the pk.
+- **`/postinfo <ref>`** — resolve a media reference (full URL / shortcode / numeric pk) to the full Post DTO. Caption, owner, taken_at, hashtags, mentions, location, media URL. Evidence collection: paste a permalink, get metadata. No active target needed.
+- **`/pinned <user>`** — list the target's pinned posts (Instagram caps at 3). What the account *wants* you to see first.
+- **`/reposts <user>`** — posts the target has reposted (IG's repost surface). Reveals amplification network. **HikerAPI only**; aiograpi has no equivalent yet.
+
+### Added — DTO
+
+- **`Place`** — new `dataclass` for IG locations: `pk`, `name`, `address`, `city`, `lat`, `lng`, `facebook_id`. Returned by `backend.search_places`, consumed by `backend.iter_place_posts`.
+
+### Backend ABC
+
+- Five new methods: `iter_user_pinned`, `iter_user_reposts`, `get_post_by_ref`, `search_places`, `iter_place_posts`. Default implementations raise `NotImplementedError` so third-party backends extending `OSINTBackend` keep compiling. HikerAPI implements all five; aiograpi implements four (no reposts).
+
+## [0.6.2] - 2026-04-29
+
+### Fixed
+
+- Spinner no longer overlaps the rich Panel on commands that print straight to stdout (`/info`, `/about`, `/resolve`, ...). Two changes: (1) `ctx.print` now stops the spinner before writing, so any first user-facing output cleans the spinner line; (2) `_stop_spinner` erases the line synchronously instead of waiting for the spinner loop's next tick, so a fast follow-up panel doesn't render on top of a half-painted frame.
+
+## [0.6.1] - 2026-04-29
+
+### Added
+
+- **`/about <user>`** — surface the raw IG `user_about` payload as its own command (joined date, country, former usernames, verified flag). Cheaper than `/info` (one fewer call) and JSON-exportable for pipelines that want only this slice.
+- **`/info` shows the avatar URL** as an OSC-8 hyperlink ("open"); modern terminals (iTerm2, kitty, Apple Terminal) make it clickable. The full signed CDN URL is hidden behind the link so the panel stays tidy. Hint to `/propic` for offline downloads.
+- **`/info` surfaces more `user_about` fields**: `created` (account-joined date), `former usernames`. Were silently dropped before because the renderer was looking for the wrong keys.
+
+## [0.6.0] - 2026-04-29
+
+### Added
+
+- **`/intersect <a> <b>`** — followers(@a) ∩ followers(@b). New OSINT primitive: shared audience between two targets reveals communities, staff, family, PR networks. Both follower fetches run concurrently (different pks so the backend serves in parallel). Default window 1000 per side; `--limit N` to widen, `--limit 0` for unbounded. Maltego export uses `{a}_{b}` as a synthetic target dir so the file colocates with other artifacts.
+- **`/timeline <user>`** — posting cadence histogram. 24-bucket hour-of-day sparkline + 7-bucket day-of-week bar chart over the last N posts. Reveals timezone (sleeping hours), human vs scheduler-driven posting, weekday vs weekend rhythm. UTC-bucketed; JSON export carries the raw bucket arrays for further analysis.
+- **/dossier section progress bar** — 9-step tqdm bar that ticks once per section completes. Pairs with the v0.5.5 spinner: spinner runs during pre-flight, hands off to the bar once sections start.
+- **`insto setup --non-interactive`** — config wizard driven entirely by env vars + existing config without prompts. Errors loudly when a required field is missing. Pattern for CI / automation: `INSTO_BACKEND=hiker HIKERAPI_TOKEN=$T insto setup --non-interactive`.
+
+### Performance
+
+- **`/fans`, `/wliked`, `/wcommented` are ~5× faster.** Per-post fan-out now uses `asyncio.Semaphore(5)` + `asyncio.as_completed` instead of a serial loop. `/fans @nasa --limit 5` drops from ~17 s to 8.5 s on the same backend response time. Concurrency cap is conservative re: HikerAPI's 7-15 rps per-account limit and aiograpi's per-session throttle. Order-independent (Counter aggregation) so `as_completed` is safe.
+
+### Documentation
+
+- Command surface now renders as a 10-row table (group / commands / one-line description) instead of a paragraph list. Easier to skim when you want to know what's in `/fans` vs `/recommended` vs `/intersect`.
+- One-shot examples in the README cover the new commands (`/search`, `/fans`, `/recommended`, `/intersect`, `/timeline`).
+- `INSTO_BACKEND` env-var description backfilled (the prior text said "set to `fake` for the e2e suite" — it's been accepting `hiker` / `aiograpi` for a year).
+
+## [0.5.5] - 2026-04-29
+
+### Added
+
+- **Spinner on stderr** during command execution — pipx-style Braille wheel that paints `⢿ fans...` while the backend call sequence runs, before the per-post tqdm bar (or instead of it, for commands like `/info` / `/resolve` / `/recommended` that don't have a per-iteration loop). Auto-stops when `track()` starts a tqdm bar (tqdm reuses the same line). Honours `--no-progress` and auto-suppresses on non-TTY. Closes the silent-pause-then-output gap that made commands feel hung even on fast networks.
+
+### Fixed
+
+- `/theme<Tab>` selecting a choice now actually inserts `/theme instagram` instead of `/themeinstagram`. v0.5.4's leading-space approach turned out to drop the space on some prompt-toolkit code paths; v0.5.5 yields the choices as full-token replacements (`text="/theme instagram"`, `start_position=-len("/theme")`) so prompt-toolkit's apply step deletes the typed `/theme` and inserts the complete `/theme instagram`. Bulletproof regardless of which apply path the menu uses.
+
+## [0.5.4] - 2026-04-29
+
+### Fixed
+
+- v0.5.3 fixed `/theme<Tab>` to *show* the theme choices inline, but accepting one produced `/themeinstagram` (no separator) — prompt-toolkit inserted the completion at the cursor without the implicit space. Now the choices include a leading space in their completion text, so `/theme<Tab>` → arrow to `instagram` → Enter produces `/theme instagram`.
+
+## [0.5.3] - 2026-04-29
+
+### Fixed
+
+- Slash popup now yields argument choices for the typed-exactly command without requiring a trailing space. Before: typing `/theme` and pressing Tab only re-inserted `/theme` itself; you had to type a space to get `claude` / `instagram` / `aiograpi`. After: `/theme<Tab>` shows the themes inline. Same for `/purge` (history / snapshots / cache).
+
+## [0.5.2] - 2026-04-29
+
+### Added
+
+- **Progress bars** on long-running aggregation commands (`/fans`, `/wliked`, `/wcommented`). tqdm-based, writes to stderr so JSON / CSV stdout stays clean. Auto-suppresses on non-TTY (CI logs, piped invocations) without configuration; manual override via the new `--no-progress` global flag.
+- New dependency: `tqdm >= 4.66`. Same pattern `insta-dl` uses for download progress.
+
+### Why
+
+`/fans --limit 50` makes 100 backend round-trips per invocation — easily a minute of silent waiting. The bar shows ETA + per-step rate, which is what operators actually need to decide between "wait" and "Ctrl-C, narrow the window".
+
+## [0.5.1] - 2026-04-29
+
+### Added
+
+- **`--backend {hiker,aiograpi}`** global flag — per-invocation backend override. Same `flag > env > toml > default` precedence the rest of the config uses, so `INSTO_BACKEND=…` and `[backend]` in `config.toml` keep working.
+
+### Changed
+
+- `/fans` output now uses ❤️ / 💬 emoji for the per-channel breakdown instead of the cryptic `2L+0C` shorthand. Both the table column (`(❤️3 💬0)`) and the Maltego Notes field (`❤️2 💬3`). Easier to read at a glance and survives copy-paste into chat / docs.
+
+## [0.5.0] - 2026-04-29
+
+### Added
+
+- **`/wliked`** — top likers across the active target's recent N posts. Symmetric to the existing `/wcommented` (which counts commenters). One post-window pull, one likers call per post; default window 50, customisable via `--limit`. Flat-row CSV / JSON / Maltego export — same shape as `/wcommented`. Both backends (uses the existing `iter_post_likers` ABC).
+- **`/fans`** — composite ranking of likers + commenters as a single "superfans" view. Score = `likes + 3*comments` (a comment is ~3x more effortful than a tap-to-like). Output table shows score with the breakdown (`11  (2L + 3C)`); JSON envelope, CSV with `rank,user,likes,comments,score` columns, and Maltego CSV with score-as-weight and `"2L+3C"`-style Notes for human-readable Maltego node labels.
+- New analytics primitives: `count_wliked` (mirrors `count_wcommented` for likers), `count_fans` (composes both into a weighted ranking), `FanRow` and `FansResult` dataclasses.
+
+### Performance / cost notes
+
+- `/fans` makes `2N` backend calls per invocation (one likers + one comments call per post). On the default 50-post window that's 100 backend round-trips per `/fans` run — pass `--limit 10` for cheaper sampling. /wliked is half that cost (just likers).
+
+## [0.4.0] - 2026-04-29
+
+### Added
+
+- **`/resolve <url>`** — expand an Instagram short-link (`instagram.com/share/...`) to its canonical URL via a HEAD request through the logged-in session. aiograpi only; HikerAPI raises a clear "switch backend" error.
+- **`/audio <track_id>`** — list clips that use a given audio asset, with full Post DTOs (code, taken_at, owner). Both backends — hiker via `track_by_id_v2`, aiograpi via `track_info_by_id`. Bypasses the preview-only `track_stream_*` surface that returned skeleton media (no `code` field, breaks `/post`-style integrations).
+- **`/recommended`** — IG's category-based account recommendations for the active target. aiograpi only (the surface needs a logged-in session). For `@ferrari` returns 30 automotive-category accounts (Porsche creators, etc.).
+
+All three commands route their results through the existing JSON / CSV / Maltego export pipeline — `/recommended --maltego` writes `recommended.maltego.csv` with `maltego.Person` rows.
+
+### Changed
+
+- `[aiograpi]` extra now requires `aiograpi >= 0.8.5` (unchanged in this release; the wave-2 endpoints all landed in the 0.8.x series).
+- New `OSINTBackend` ABC methods: `resolve_short_url`, `iter_audio_clips`, `get_recommended`. Default implementations raise `NotImplementedError` so third-party backends extending the ABC don't need to implement everything to keep compiling.
+
+## [0.3.0] - 2026-04-29
+
+### Added
+
+- **`/search <query>`** — find Instagram accounts by free-text query (username, brand, location, etc). New top-level command with `--limit`, `--csv`, `--json`, and `--maltego` exports. Works on both backends via `fbsearch_accounts_v2` (HikerAPI 0.1.0+ / aiograpi 0.8.1+). Big OSINT win: insto could already drill into a *known* target, but couldn't *discover* unknown handles by name. `/search` closes that gap.
+- **`/similar` fallback chain on aiograpi** — when the primary `chaining()` private endpoint refuses a target ("Not eligible for chaining" / 403), insto now falls through to `user_related_profiles_gql` (public-graphql `edge_chaining`). Live test: `@ferrari` returns 80 suggestions on aiograpi, where the equivalent hiker call 403s. Needs aiograpi ≥ 0.8.5.
+- **`resolve_target` fallback on aiograpi** — when the public `user_id_from_username` path JSON-decode-fails (HTML challenge, intermittent gating), insto retries through `user_web_profile_info_v1` (private-host route, carries the logged-in session). Same target, more reliable plumbing.
+
+### Changed
+
+- `[aiograpi]` extra now requires `aiograpi >= 0.8.5` (was `>= 0.8.0`) — the release that landed `fbsearch_accounts_v2`, `user_related_profiles_gql`, and `user_web_profile_info_v1`. Settled at install time.
+- aiograpi-side `chaining` and `fbsearch_accounts_v2` responses are now run through `aiograpi.extractors.extract_user_short` before the insto mapper. The SERP / chaining endpoints return raw IG dicts (`pk_id` / `id` instead of `pk`); the upstream extractor reconciles them. Without this wrap, every `/similar` and `/search` row crashed with `SchemaDrift: missing field 'pk'`.
+
+## [0.2.2] - 2026-04-29
+
+### Added
+
+- **`tests/live/smoke.py`** — structured live smoke against the real HikerAPI, eight REQ checks + one OPT (`/similar`). Skips with exit 0 when `HIKERAPI_TOKEN_TEST` is unset, so it's safe in any release-prep gate. Costs ~10 calls, single-digit cents. See `CONTRIBUTING.md`.
+- **`/health` observability** — extends the existing quota / drift output with per-call latency p50/p95/max, cumulative call count, and a breakdown of `BackendError` subtypes seen this session. Instrumented at the `_call` boundary in both backends; latencies are kept in a 1000-slot ring (~8 KB).
+- **`/dossier --maltego`** — promised in the README since v0.1, finally implemented. Each maltego-eligible section (followers, following, mutuals, hashtags, mentions, locations, wcommented, wtagged) writes a `.maltego.csv` with the standard `Type, Value, Weight, Notes, Properties` shape; profile.json + posts.json keep their JSON form. Verified live on both hiker and aiograpi backends.
+
+### Fixed
+
+- `iter_hashtag_posts` was silently broken on the real HikerAPI: hashtag responses use `response.sections[*].layout_content.medias[*].media`, not the generic `users/items/comments` keys, and the cursor at the top level is `next_page_id` (a base64 envelope), not the inner `next_max_id` (a hex string the server rejects). The live smoke caught this — mocks always passed because the fakes mirrored the wrong shape.
+
+## [0.2.1] - 2026-04-28
+
+### Added
+
+- `/tagged` and `/similar` now work on the aiograpi backend. The first via `usertag_medias_v1` (already in aiograpi 0.7 — the previous "not exposed" stub was wrong), the second via the freshly-landed `chaining` + `fetch_suggestion_details` in [aiograpi 0.8.0](https://github.com/subzeroid/aiograpi/releases/tag/0.8.0). All 14 `OSINTBackend` methods now land on both backends.
+
+### Changed
+
+- `[aiograpi]` extra now requires `aiograpi >= 0.8.0` (was `>= 0.7.2`) — the upstream release that adds the chaining endpoints.
+- `aiograpi.exceptions.InvalidTargetUser` ("Not eligible for chaining.") is mapped to a clear `BackendError("target not eligible: ...")` instead of falling through to a generic transient.
+
+### Documentation
+
+- `docs/backends.md` matrix simplified — no per-backend gaps remain. The "HikerAPI 403" note now correctly describes `/similar` as per-target flaky (Instagram refuses chaining for some user_ids), not "endpoint retired".
+
+## [0.2.0] - 2026-04-28
+
+### Added
+
+- `AiograpiBackend` over [aiograpi](https://github.com/subzeroid/aiograpi) 0.7.2, gated behind the new `insto[aiograpi]` optional install. Login is lazy, session persists to `~/.insto/aiograpi.session.json` (mode `0600`). 12 of the 14 `OSINTBackend` methods land on this backend — only `/similar` (endpoint retired upstream) and `/tagged` (aiograpi 0.7 has no `user_tag_medias`) refuse with a clear "needs hiker backend" error.
+- `Config` gained `backend`, `aiograpi.username`, `aiograpi.password`, `aiograpi.totp_seed`, `aiograpi.session_path` keys. Same `flag > env > toml > default` precedence; `password` and `totp_seed` register with the global redaction set so they never reach error output or rotating logs.
+- Setup wizard now asks `backend (hiker | aiograpi)` first and only prompts for the credentials relevant to that backend. Existing `hiker.token` and `aiograpi` block are preserved when you flip backends.
+- `make_backend("aiograpi", ...)` — lazy import; if the user did not install `insto[aiograpi]`, returns `RuntimeError` with the exact `pip / uv / pipx install 'insto[aiograpi]'` command.
+- Per-command argument completion in the slash popup: `/theme<Tab>` lists `aiograpi / claude / instagram`; `/purge<Tab>` lists `history / snapshots / cache`. Mechanism walks the command's argparse `choices=` automatically — every future command with `choices` gets completion for free.
+- Slash popup keeps re-rendering across the entire first-token typing (`/`, `/i`, `/in`, `/info`) by binding every command-name character explicitly, so `complete_while_typing`'s debounce window does not flicker the popup.
+- `/help` and the slash popup show positional-argument signatures (`/theme [name]`, `/posts [count]`, `/batch <file> <cmd>`).
+- Three named themes (`/theme`): `claude` (Claude Code burnt orange), `instagram` (Instagram 2022+ conic gradient), `aiograpi` (purple → blue with violet accent — default since 0.2.0). The figlet INSTO logotype renders per-row gradient on themes that define one.
+
+### Changed
+
+- Default theme is now `aiograpi`. Existing users with `theme = "..."` in `~/.insto/config.toml` are unaffected.
+- HikerAPI 403 is mapped to a clearer message — Instagram returns 403 to login-walled / region-restricted endpoints, not "your account is banned". The `Banned` exception now carries the diagnosis without the misleading `backend account is banned:` prefix.
+- Welcome banner reads the live backend label from the class name (`hiker` / `aiograpi`) instead of the hard-coded `hiker · ...` literal.
+
+### Fixed
+
+- `Ctrl+C` in the REPL cancels the current line and re-prompts (shell / IPython convention) instead of exiting. `Ctrl+D` on an empty line still exits.
+- `/theme instagram` now actually paints the figlet rows in the brand gradient — the previous fix used a Rich style string Rich could not parse (`"bold logo.0"` with a dotted theme key).
+
+### Documentation
+
+- `docs/backends.md` rewritten to cover both backends + the install matrix.
+- README updated for `pip install 'insto[aiograpi]'` and the new welcome screenshot. `pip install` PEP 668 trap explained.
+
+## [0.1.1] - 2026-04-28
+
+### Fixed
+
+- `_hiker_map` now accepts ISO-8601 strings (`2026-04-17T17:45:12Z`) for `taken_at` / `created_at` / `expiring_at` in addition to unix integers. HikerAPI's `user_medias_chunk_v1` returns the ISO shape, so `/posts`, `/dossier`, `/reels`, `/tagged` were previously raising `SchemaDrift` on every live call.
+- REPL welcome banner now refreshes the HikerAPI balance synchronously before render, so the bottom toolbar shows real numbers ("14.7M requests left · $4,417 · 15 rps cap") on first paint instead of "balance: pending".
+- Setup wizard resolves `output_dir` and `db_path` to absolute paths, so behaviour no longer depends on the CWD where `insto` is later invoked.
+
+### Added
+
+- Inline target on every single-target slash command (`/info instagram`, `/posts instagram`, `/dossier instagram`...) without mutating the active session target.
+- Slash popup styling: typing `/` opens a Claude-Code-like popup of all commands with help-text in the right column. `complete_style=COLUMN`, `reserve_space_for_menu=10`, dedicated dark-slate Style for the menu.
+- `/info`-style commands now thread an optional positional `target` through `with_target` / `with_pk` via the new `add_target_arg` and `compose_args` helpers in `commands/_base.py`.
+- Setup wizard prompt for proxy now lists supported schemes inline: `proxy URL (http://, https://, socks5h://) (optional, '-' to clear)`.
+
+### Changed
+
+- Welcome banner: replaced the chafa pixel-art wasp with a typographic INSTO logotype (figlet "standard") plus the tagline `i n s t o ⇋ o s i n t · instagram tool · open-source intel`. No image deps, identical rendering on light and dark schemes, no third-party watermark to mask.
+- `Quota` model gained `rate`, `amount`, `currency` fields populated from `/sys/balance`. `HikerBackend.refresh_quota()` is the new entry point; `/quota` always re-fetches before rendering.
+
+### Documentation
+
+- Full mkdocs Material site at https://subzeroid.github.io/insto/ — index, installation, basic-usage, cli-reference, backends, architecture, troubleshooting, contributing, changelog.
+- LICENSE (MIT), CHANGELOG.md, SECURITY.md, CONTRIBUTING.md added at the repo root.
+- `pyproject.toml` populated with classifiers, keywords, project URLs, and `[docs]` extras.
+
+### CI
+
+- `release.yml` — tag-driven build + trusted-publish to PyPI + GitHub release.
+- `release-please.yml` — Conventional Commits → CHANGELOG automation.
+- `docs.yml` — mkdocs deploy to GitHub Pages on `main`.
+- `pr-title.yml` — semantic PR title gate.
+
+## [0.1.0] - 2026-04-27
+
+### Added
+
+Initial public release.
+
+- Interactive REPL (`insto`) with prompt_toolkit completer (slash popup of commands, like Claude Code), bottom toolbar (active target · backend · live HikerAPI balance + rate cap), Ctrl+T / Ctrl+L keybindings, history at `~/.insto/cli_history`.
+- One-shot CLI (`insto @user -c <cmd> [args]`) with the same command grammar; works in shell pipelines via `--json -` / `--csv -` to stdout and `/batch -` from stdin.
+- Slash-command surface across seven groups:
+  - Target — `/target`, `/current`, `/clear`
+  - Profile — `/info`, `/propic`, `/email`, `/phone`, `/export`
+  - Media — `/stories`, `/highlights`, `/posts`, `/reels`, `/tagged`
+  - Network — `/followers`, `/followings`, `/mutuals`, `/similar`
+  - Content analysis — `/locations`, `/hashtags`, `/mentions`, `/captions`, `/likes`
+  - Interactions — `/comments`, `/wcommented`, `/wtagged`
+  - Operational — `/quota`, `/health`, `/config`, `/purge`, `/help`
+- `/dossier` killer-feature: collects info + posts + followers + following + mutuals + hashtags + mentions + locations + wcommented + wtagged into one structured directory under `output/<user>/dossier/<datetime>/` with a `MANIFEST.md` summary. Sections fan out via `asyncio.gather` and tolerate partial completion on `QuotaExhausted`.
+- `/batch` with concurrency cap, jittered per-target sleep, stdin support, dedup, JSONL resume on `output/.batch-<sha>.jsonl`, and graceful exit on `QuotaExhausted`.
+- `/watch` in-session monitoring (max 3 active, ≥ 5 min interval, paused after 2 consecutive errors, `patch_stdout` notifications).
+- `OSINTBackend` ABC with lazy backend imports. `HikerBackend` for v0.1; aiograpi planned for v0.2 — requirement annotations (`requires=("followed",)`) already in place.
+- Hardened CDN streamer: host allowlist, HTTPS-only, no cross-host redirects, MIME cross-check, byte budget (per-resource and per-command), atomic write, collision suffix, disk guard, macOS xattr tagging.
+- sqlite-backed history / snapshots / watches at `~/.insto/store.db` (mode `0600`) with retention prune, schema versioning, `BEGIN IMMEDIATE` migration lock.
+- OPSEC: `--proxy` / `HIKERAPI_PROXY` (Tor / corp proxy), `_redact_secrets` strips tokens from errors and rotating-file log (`~/.insto/logs/insto.log`).
+- Maltego CSV exporter (`--maltego` / `--output-format maltego`).
+- Shell completion via `insto --print-completion {bash|zsh}` (requires `insto[completion]`).
+
+### Notes
+
+- Secret redaction covers stack traces, log files, and CLI error output.
+- All 24 OSINT commands accept an inline target argument (`/info instagram`) without mutating the active session target.

@@ -1,0 +1,355 @@
+# insto
+
+Interactive Instagram OSINT CLI on the [HikerAPI](https://hikerapi.com/p/6k1q1388) backend and optional [aiograpi](https://github.com/subzeroid/aiograpi) logged-in backend.
+
+## Telegram Instagram Bot V1: open-source project status
+
+This repository includes an optional Telegram bot built on the `insto` Instagram
+client. I am sharing the current implementation as an early-stage open-source
+project so interested developers can use it, review it, and help develop it
+into a more complete and reliable bot. It is a working prototype, not a
+finished, hosted production service.
+
+### Implemented so far
+
+- Accepts Instagram post and Reel URLs in a Telegram chat and replies with the
+  canonical link.
+- Offers a media download only after the sender confirms they own the media or
+  have permission to download it.
+- Uses the existing `insto` backend and download safety limits; Telegram's
+  upload-size limits still apply.
+- Includes setup instructions, a `.env` option for the bot token, and focused
+  tests for URL parsing and the Telegram flow.
+- Includes the broader `insto` CLI, documentation, and test suite in this
+  repository.
+
+### Current scope and next steps
+
+The main link-sharing and permission-confirmed download flow is implemented,
+but the project still needs community testing and further development before
+it should be considered production-ready. Useful next steps include testing
+with different Instagram links and backend configurations, improving setup and
+error guidance, and adding deployment/hosting instructions. The bot must be
+kept running by its operator to receive messages; this repository does not
+provide a hosted bot or uptime service.
+
+Contributions and constructive feedback are welcome. Use the bot only for
+media you own or are authorized to download, and follow Instagram's and
+Telegram's terms and applicable laws. The code is released under the MIT
+License; see [LICENSE](LICENSE).
+
+![demo](docs/demo.gif)
+
+## Design choices
+
+- **HikerAPI is the default backend, not a side mode.** Quota balance is read on REPL startup and surfaced in the bottom toolbar; `with_retry` honours `RateLimited.retry_after`; every mapper raises typed `SchemaDrift(endpoint, missing_field)` when HikerAPI's documented fields move. Logged-in `aiograpi` is one extra (`pipx install 'insto[aiograpi]'`) when you actually need data behind the login wall — but kept off the default path so your account isn't in scope.
+- **Async, typed, tested.** Python >= 3.11, strict mypy, ruff-clean, and 900+ offline tests. Backends, facade, commands all `async def`.
+- **Two surfaces, one grammar.** A prompt-toolkit REPL with slash-popup completion and live `/watch` notifications, *and* a Unix-friendly one-shot mode (`insto @user -c info`). `--json -` and `--csv -` write to stdout; `/batch -` reads targets from stdin.
+- **Persistent snapshot / watch / diff.** Registrations and snapshots live in `~/.insto/store.db`; run them in the REPL or keep `insto watch-daemon` in the foreground across REPL exits and restarts.
+- **Maltego CSV export** out of the box (`--maltego` on any flat-row command, plus full `/dossier`).
+
+Two surfaces over the same command grammar:
+
+- **REPL** — `insto` (or `insto @user` to pre-select a target) drops you into a
+  prompt-toolkit session with tab-completion, a bottom toolbar (active target,
+  backend, quota), six switchable colour themes (`/theme` opens a live-preview
+  picker), and live `/watch` notifications. Visually similar to the Claude Code
+  welcome screen.
+- **One-shot** — `insto @user -c <command> [args]` runs a single slash-command
+  and exits. Pipe-friendly: `--json -` writes to stdout, `--csv -` does the
+  same for flat commands, `/batch -` reads targets from stdin.
+
+## Install
+
+Requires Python ≥ 3.11. Pick the install path that matches how you keep
+other CLIs:
+
+```sh
+uv tool install insto              # uv users — fastest, no venv to manage
+pipx install insto                 # pip users — same effect, classic tool
+brew install pipx && pipx install insto   # macOS, no Python yet
+```
+
+For the optional logged-in `aiograpi` backend (private accounts, posts
+behind Instagram's login wall) install with the extra:
+
+```sh
+uv tool install 'insto[aiograpi]'
+pipx install 'insto[aiograpi]'
+```
+
+If `insto` is already installed and you later switch to `aiograpi`, update the
+existing tool environment instead of running the bare installer again:
+
+```sh
+pipx inject insto aiograpi                         # existing pipx install
+uv tool install --force 'insto[aiograpi]'          # existing uv tool install
+```
+
+`insto setup` then offers a `hikerapi | aiograpi` choice and prompts for
+the right credentials. See [`docs/backends.md`](docs/backends.md) for
+the trade-offs and the account-ban risk on aiograpi.
+
+> **Got `insto: command not found` after install?** Both `pipx` and
+> `uv tool` install into `~/.local/bin`, which is not on `$PATH` by
+> default on a fresh Linux box. Fix it once:
+>
+> ```sh
+> pipx ensurepath           # or: uv tool update-shell
+> exec "$SHELL"             # reload PATH in the current session
+> insto --version
+> ```
+
+Or from a checkout (development):
+
+```sh
+git clone git@github.com:subzeroid/insto.git
+cd insto
+uv sync && uv run insto --help     # editable inside .venv
+# or:  uv tool install --editable .   to put `insto` on $PATH
+```
+
+> ℹ️ **Bare `pip install insto` does not work on modern systems by default**
+> (PEP 668 — Homebrew Python, Debian 12+, Ubuntu 23.04+ all reject system-wide
+> pip writes). Use `pipx` or `uv tool install` — both create an isolated
+> venv per CLI, no manual sourcing.
+
+## Setup
+
+```sh
+insto setup
+```
+
+Interactive wizard. Writes `~/.insto/config.toml` (mode `0600`) with your
+backend choice, HikerAPI token or aiograpi credentials, output directory,
+sqlite store path, and optional proxy. The HikerAPI token prompt links to
+<https://hikerapi.com/tokens>. Secrets are read with `getpass` so they do not
+echo to the terminal; pass `-` for the proxy to clear a previously-saved value.
+
+> 💸 **HikerAPI gives you 100 free requests** to try things out — no card,
+> no email-verification dance, just sign up and a token is waiting:
+> <https://hikerapi.com/p/6k1q1388>. That's enough for a couple of full
+> `/dossier` runs or many `/info` / `/where` / `/timeline` calls — pick a
+> target you already know to test the surface before deciding whether to
+> top up.
+
+For an optional Telegram bot that shares Instagram links and sends media back
+only after an ownership/permission confirmation, install
+`uv tool install 'insto[telegram]'`, set `TELEGRAM_BOT_TOKEN`, and run
+`insto-telegram` on Linux/macOS or from WSL. See
+[`docs/basic-usage.md`](docs/basic-usage.md#telegram-bot).
+
+Token precedence is **flag > env (`HIKERAPI_TOKEN`) > config.toml**; the same
+precedence applies to the proxy (`--proxy`, `HIKERAPI_PROXY`,
+`[hikerapi].proxy`). `socks5h://` (Tor) and `http://` proxies are both
+supported.
+
+### Environment variables
+
+| Variable          | Purpose                                                             |
+|-------------------|---------------------------------------------------------------------|
+| `HIKERAPI_TOKEN`  | API token (overrides `[hikerapi].token` in config.toml)             |
+| `HIKERAPI_PROXY`  | Proxy URL (overrides `[hikerapi].proxy`)                            |
+| `INSTO_HOME`      | Override the default `~/.insto/` config root                        |
+| `INSTO_BACKEND`   | `hikerapi` (default) / `aiograpi` / `fake` (e2e suite). Same as `--backend` and `[backend]` in `config.toml`; legacy `hiker` is still accepted |
+| `INSTO_WATCH_WEBHOOK_URL` | Environment-only endpoint for watch-change JSON; empty or unset disables delivery |
+| `TELEGRAM_BOT_TOKEN` | Optional Telegram bot token for the `insto-telegram` entry point |
+
+## How insto compares to other Instagram OSINT tools
+
+| | insto | [Osintgram](https://github.com/Datalux/Osintgram) | [Toutatis](https://github.com/megadose/toutatis) | [Sherlock](https://github.com/sherlock-project/sherlock) |
+|---|---|---|---|---|
+| Backends supported | [HikerAPI](https://hikerapi.com/p/6k1q1388) (default) + aiograpi | Username/password (default) + HikerAPI ([#2586](https://github.com/Datalux/Osintgram/pull/2586)) | Logged-in Instagram session | HTTP probes — multi-site |
+| Default backend | HikerAPI — no IG session in scope | Logged-in Instagram session | Logged-in Instagram session | N/A — username probing |
+| Scope | Instagram deep dive | Instagram only | Instagram (email/phone focus) | 400+ sites, username search |
+| Geo OSINT (`/where`, `/place`, `/placeposts`) | ✅ unique | ❌ | ❌ | ❌ |
+| Network ops (`/intersect`, `/mutuals`) | ✅ unique | ❌ | ❌ | ❌ |
+| Posting cadence (`/timeline`) | ✅ unique | ❌ | ❌ | ❌ |
+| Superfan ranking (`/fans`) | ✅ unique | ❌ partial | ❌ | ❌ |
+| Snapshot / watch / diff | ✅ sqlite-backed | ❌ | ❌ | ❌ |
+| Maltego CSV export | ✅ | ❌ | ❌ | ❌ |
+| Interactive REPL | ✅ prompt-toolkit, slash-popup | ✅ basic shell | ❌ one-shot | ❌ one-shot |
+| One-shot / scriptable | ✅ stdin/stdout pipes | ⚠️ shell only | ✅ | ✅ |
+| Type-safe / strict mypy | ✅ strict mypy + coverage gate | ❌ | ❌ | ❌ |
+
+**When to pick insto** — Instagram-specific OSINT where you want HikerAPI on the default path (no IG session is ever in scope), deep network/geo analytics, snapshots over time, and Maltego-ready export. Modern stack — asyncio, strict mypy, prompt-toolkit REPL with slash-popup completion.
+
+**When to pick Osintgram** — historic OSS standard, large existing community. As of PR [#2586](https://github.com/Datalux/Osintgram/pull/2586) (merged Aug 2025) it can also run through HikerAPI via `HIKERAPI_TOKEN` so you don't have to use a logged-in Instagram account. The default path is still username/password and the command surface is the original Osintgram one — no `/where`, `/intersect`, `/timeline`, or `/fans` analytics.
+
+**When to pick Toutatis** — narrow goal: extract email + phone hints from a target's `user_info`. It's smaller and single-purpose. insto's `/email` and `/phone` cover the same data through HikerAPI without an Instagram login.
+
+**When to pick Sherlock / Maigret** — you're doing username reconnaissance across many platforms (forums, image hosts, code hosts). Different tool category — pair with insto for Instagram depth after Sherlock points you at an account.
+
+Related projects: [aiograpi](https://github.com/subzeroid/aiograpi) (the async Instagram private API library that powers insto's optional `[aiograpi]` backend), [Social-Media-OSINT-Tools-Collection](https://github.com/subzeroid/Social-Media-OSINT-Tools-Collection) (curated tools list), [awesome-osint](https://github.com/subzeroid/awesome-osint).
+
+## Examples
+
+REPL:
+
+```text
+$ insto
+                                Tips for getting started
+  ___ _   _ ____ _____ ___      /target <user>  set OSINT target
+ |_ _| \ | / ___|_   _/ _ \     /info           full profile dump
+  | ||  \| \___ \ | || | | |    /help           list all commands
+  | || |\  |___) || || |_| |
+ |___|_| \_|____/ |_| \___/     Recent activity
+                                @nasa
+ i n s t o  ⇋  o s i n t        @instagram
+ instagram tool · open-source intel
+                                hikerapi · 14.7M requests left · $4,417 · 15 rps cap
+
+insto @→ /
+```
+
+Type `/` and the popup opens with every command (Slack / Claude Code style):
+
+```text
+insto @→ /info
+> /target ferrari
+> /info
+> /posts 10                   # last 10 feed posts, media saved under output/ferrari/posts/
+> /posts 10 --no-download     # URLs only, no CDN write
+> /followers 500 --csv followers.csv
+> /diff
+> /watch ferrari 600          # poll every 10 minutes (5 min floor)
+> /dossier                    # collect a full target package
+> /quit
+```
+
+`/info <user>` is also valid as inline form — runs the lookup without
+mutating the active session target. Same for every single-target
+command (`/posts nasa 5`, `/dossier nasa`, ...).
+
+One-shot:
+
+```sh
+insto @ferrari -c info
+insto -c info instagram                                    # inline target, no REPL state
+insto @ferrari -c posts 10 --json -                        # 10 posts, JSON to stdout
+insto @ferrari -c followers 500 --csv followers.csv
+insto @ferrari -c followers 200 --maltego                  # Maltego CSV under output/ferrari/
+insto -c search ferrari 20 --maltego                       # full SERP, no active target needed
+insto @nasa -c fans --limit 10                             # top fans = ❤️ + 3*💬 across 10 posts
+insto @ferrari -c recommended --maltego                    # IG's "same category" recommendations
+cat targets.txt | insto -c batch - info --yes              # stdin pipe + non-interactive
+insto -c dossier instagram --maltego                       # full target package, Maltego CSVs per section
+insto @ferrari -c watch                                   # persist a 5-minute watch and exit
+insto watch-daemon                                        # execute persisted watches in foreground
+insto watch-service install                               # macOS: run at login, without sudo
+insto watch-service status --json                         # service + persisted watch status
+insto watch-service uninstall                             # preserve watches, config and logs
+```
+
+Only one REPL or daemon executes watches for a given sqlite store. Registrations
+remain available to every process through the store; `/watching` shows active or
+paused state, and `/watch` explicitly reactivates a paused target. The daemon
+prints its recovered-watch count, estimated backend load, and backend-specific
+quota/cost or account-risk reminder at startup. Stop it with `Ctrl+C` or
+`SIGTERM`; a later start resumes due watches without overlapping ticks.
+
+Set `INSTO_WATCH_WEBHOOK_URL` to send best-effort JSON notifications from the
+REPL or watch daemon after persisted profile changes. One-shot commands never
+send them. Insto does not persist the URL, and `/config` reports only `configured` or
+`disabled`, never the value. Use a trusted HTTPS receiver; HTTP is accepted only
+for localhost or a loopback address. See [Basic usage](docs/basic-usage.md#watch-webhook-notifications)
+for the payload and delivery contract.
+
+On macOS, `watch-service` manages a user LaunchAgent around the same daemon.
+Install uses the protected `config.toml`, not credentials inherited from the
+terminal. An optional explicit private TOML file supplies environment-only
+settings such as the webhook URL; only its path is stored in the service
+definition. See [macOS user service](docs/basic-usage.md#macos-user-service)
+for setup, safe secret handling, status, and recovery. The agent runs while you
+are logged in and the machine is awake, not before login or during sleep.
+
+`-c <cmd>` consumes the rest of `argv` as the slash-command's arguments,
+so `-c batch targets.txt info` runs `batch targets.txt info` (one `-c`
+per invocation). `--yes` is required when `/batch` reads from stdin or
+when the target list exceeds the confirmation threshold.
+
+### Global flags
+
+| Flag                            | Purpose                                                  |
+|---------------------------------|----------------------------------------------------------|
+| `-c / --cmd <name> [args...]`   | One-shot mode: run a single slash-command and exit       |
+| `-i / --interactive`            | Force the REPL even when a target is provided            |
+| `--proxy <url>`                 | Override `HIKERAPI_PROXY` for this invocation            |
+| `--json [PATH or -]`            | Write the JSON envelope (default path, file, or stdout)  |
+| `--csv  [PATH or -]`            | Same for flat-row commands                               |
+| `--maltego [PATH or -]`         | Maltego entity-import CSV (alias for `--output-format maltego`) |
+| `--output-format {json,csv,maltego}` | Explicit format selector                            |
+| `--limit N` / `--no-download`   | Per-command paging cap and media opt-out                 |
+| `--backend {hikerapi,aiograpi}` | Backend selector for this invocation (overrides `$INSTO_BACKEND` and `config.toml`) |
+| `--no-progress`                 | Suppress tqdm bars + spinner on long commands (`/fans`, `/wliked`, `/wcommented`, `/dossier`) |
+| `--yes / -y`                    | Skip confirmation prompts (required for `/batch -`)      |
+| `--verbose` / `--debug`         | Logging level for `~/.insto/logs/insto.log`              |
+| `--version`                     | Print the version and exit                               |
+| `--print-completion {bash,zsh}` | Emit a shell-completion script                           |
+
+Pipe to `jq`:
+
+```sh
+insto @ferrari -c info --json - | jq '.username, .followers_count'
+```
+
+Shell completion (uses `argparse` via `shtab`):
+
+```sh
+insto --print-completion zsh > ~/.insto/_insto
+echo 'fpath+=~/.insto && autoload -Uz compinit && compinit' >> ~/.zshrc
+```
+
+## Command surface
+
+🔥 marks the killer-feature commands — the ones that are uniquely OSINT-positioned and don't have obvious equivalents in other tools.
+
+| Group | Commands | What it does |
+|---|---|---|
+| **Profile** | `info` `about` `propic` `email` `phone` `export` `pinned` | profile dump, user_about slice, avatar download, contact extraction, JSON export, pinned posts |
+| **Media** | `posts` `reels` `reposts` `stories` `highlights` `tagged` `audio` `postinfo` 🔥 | feed media, reposts, stories, highlights, tagged-in, audio-asset → clips, **`postinfo` resolves any URL/code/pk to full Post DTO** |
+| **Network** | `followers` `followings` `mutuals` `intersect` 🔥 `similar` `search` 🔥 `recommended` | follower lists, self-intersection, **`intersect` = followers(@a) ∩ followers(@b)**, suggested similar, **`search` = free-text account discovery**, category recommendations |
+| **Geo** | `locations` `where` 🔥 `place` 🔥 `placeposts` 🔥 | location frequency, **`where` = geo fingerprint (anchor + centroid + radius)**, **`place` = text → IG locations**, **`placeposts` = top media at a location** |
+| **Content** | `hashtags` `mentions` `captions` `likes` `timeline` 🔥 | top hashtags / @mentions / captions, like-count stats, **`timeline` = posting-cadence histogram (hour-of-day + day-of-week)** |
+| **Interactions** | `comments` `wcommented` `wliked` `wtagged` `fans` 🔥 | per-post + aggregated comments, top commenters / likers / taggers, **`fans` = weighted superfan ranking (likes + 3×comments)** |
+| **Discovery** | `resolve` | expand `instagram.com/share/...` short-links to canonical URLs (aiograpi only) |
+| **Direct** | `direct` `direct-thread` | read-only Direct threads and messages (aiograpi only) |
+| **Saved** | `collections` `saved` | read-only saved collections and saved posts for the logged-in aiograpi account |
+| **Watch / diff** | `watch` `unwatch` `watching` `diff` `history` | persistent poll-based snapshot diffing; foreground daemon; cli-history |
+| **Operational** | `quota` `health` `config` `purge` | balance + p50/p95 latency + error breakdown, effective config with origins, sqlite/cache cleanup |
+| **Session** | `target` `current` `clear` | active-target plumbing for the REPL |
+| **Batch / dossier** | `batch` `dossier` 🔥 | run one command across a target list, **`dossier` = full target package (profile + media + network + analytics) with `--maltego` CSV per section** |
+
+Inside the REPL each command may be invoked with or without a leading `/`.
+
+Pretty much every command takes `--limit N` (paging cap) and supports `--json` / `--csv` / `--maltego` export to file or `-` for stdout. Long-running aggregations (`/fans`, `/wliked`, `/wcommented`, `/dossier`) show a tqdm progress bar; everything else gets a `⢿ <cmd>...` spinner during the silent setup wait.
+
+## Where things go
+
+- `~/.insto/config.toml` — settings (mode `0600`).
+- `~/.insto/store.db` — sqlite store: snapshots, watches, cli history.
+- `~/.insto/store.db.watch.lock` — stable owner-only POSIX executor lock (kept on disk, advisory ownership is released when the process exits).
+- `~/.insto/logs/insto.log` — rotating log file (mode `0600`, secrets redacted).
+- `~/.insto/aiograpi.session.json` — persisted Instagram session for the
+  aiograpi backend (mode `0600`; only created when you pick that backend).
+- `./output/<user>/<type>/…` — downloaded media. Override with
+  `[output_dir]` in config or `--out` on commands that accept it.
+
+## Documentation
+
+Full docs at <https://subzeroid.github.io/insto/>:
+
+- [**🔥 Killer features**](https://subzeroid.github.io/insto/killer-features/) — `/dossier`, `/where`, `/intersect`, `/fans`, `/place`, `/postinfo`, `/timeline`, `/search` with real output examples.
+- [**📓 OSINT recipes**](https://subzeroid.github.io/insto/recipes/) — concrete investigative scenarios: find someone's likely city, detect sockpuppet rings, evidence-archive a post chain, audit your own footprint, etc.
+- [Installation](https://subzeroid.github.io/insto/installation/)
+- [Basic usage](https://subzeroid.github.io/insto/basic-usage/)
+- [CLI reference](https://subzeroid.github.io/insto/cli-reference/)
+- [Backends](https://subzeroid.github.io/insto/backends/)
+- [Architecture](https://subzeroid.github.io/insto/architecture/)
+- [Troubleshooting](https://subzeroid.github.io/insto/troubleshooting/)
+
+Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md). Security policy: [SECURITY.md](SECURITY.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

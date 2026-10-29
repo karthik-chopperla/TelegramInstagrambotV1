@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The repository default for GITHUB_TOKEN is write. These jobs only need to
+# read the checkout, and they execute third-party code (dependency build
+# scripts under `uv sync`), so the token is narrowed here.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        # Install the aiograpi extra so its backend module gets exercised
+        # by tests. Without it, insto.backends.aiograpi imports lazily
+        # and coverage shows 0% for the entire file.
+        run: uv sync --extra aiograpi
+
+      - name: Ruff check
+        run: uv run ruff check
+
+      - name: Ruff format check
+        run: uv run ruff format --check
+
+      - name: Mypy
+        run: uv run mypy insto
+
+      - name: Pytest with coverage
+        # Threshold lowered from 80 to 75 in v0.7.x while we ratchet up
+        # contract-test coverage of the network-glue modules (hiker.py
+        # and aiograpi.py — both are mostly thin SDK wrappers, real
+        # logic lives in mappers + analytics + commands which have 80+%).
+        # See issue tracker before raising back to 80.
+        run: uv run pytest --cov=insto --cov-fail-under=75
+
+  macos-watch-service:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+      - name: Install offline test dependencies
+        run: uv sync --frozen
+      - name: Service and CLI contracts
+        run: >-
+          uv run --frozen pytest tests/test_watch_service.py
+          tests/test_watch_service_runner.py tests/test_watch_service_cli.py
+          tests/test_history_readonly.py tests/e2e/test_watch_daemon.py
+      - name: Build and install wheel for native smoke
+        run: |
+          uv build --wheel --out-dir "$RUNNER_TEMP/insto-service-dist"
+          uv venv --python 3.11 "$RUNNER_TEMP/insto-service-venv"
+          uv pip install --python "$RUNNER_TEMP/insto-service-venv/bin/python" "$RUNNER_TEMP"/insto-service-dist/*.whl
+      - name: Native LaunchAgent smoke (explicit skip without GUI domain)
+        env:
+          INSTO_TEST_LAUNCHD: "1"
+        run: |
+          INSTO_TEST_PYTHON="$RUNNER_TEMP/insto-service-venv/bin/python" uv run --frozen pytest tests/e2e/test_watch_service.py tests/e2e/test_desktop_migration.py -q -rs
+
+  live-test:
+    # Live aiograpi end-to-end through the real CLI entrypoint, driven by
+    # pooled accounts. Canonical-repo only: PRs from forks never receive the
+    # TEST_ACCOUNTS_URL secret. The script self-skips (exit 0) when the secret
+    # is absent, so this job is green even before the secret is configured.
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.repository == 'subzeroid/insto'
+    env:
+      TEST_ACCOUNTS_URL: ${{ secrets.TEST_ACCOUNTS_URL }}
+      IG_PROXY: ${{ secrets.IG_PROXY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies
+        run: uv sync --extra aiograpi
+
+      - name: aiograpi /info end-to-end
+        # Spawns `insto @instagram -c info --json -` against a pooled account
+        # (full login incl. TOTP) and asserts the JSON profile. Skips clean
+        # if TEST_ACCOUNTS_URL is unset.
+        run: uv run python tests/live/aiograpi_info_e2e.py

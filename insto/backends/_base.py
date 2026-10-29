@@ -1,0 +1,238 @@
+"""Abstract OSINT backend interface.
+
+`OSINTBackend` is the contract every backend (HikerAPI, aiograpi, future
+TikTok / Bluesky / Threads providers) must implement. The command and service
+layers depend on this ABC, never on a concrete backend.
+
+All collection-returning methods are async generators (`AsyncIterator[T]`)
+with an optional `limit: int | None` parameter. Cursors / page tokens are an
+internal implementation detail of each backend and never leak above this
+layer.
+
+The methods raise exceptions from `insto.exceptions` exclusively; raw HTTP /
+SDK errors must be mapped to the taxonomy by the backend itself.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from typing import Any
+
+from insto.exceptions import BackendError
+from insto.models import (
+    Comment,
+    DirectMessage,
+    DirectThread,
+    Highlight,
+    HighlightItem,
+    Place,
+    Post,
+    Profile,
+    Quota,
+    SavedCollection,
+    Story,
+    User,
+)
+from insto.service.metrics import Metrics, MetricsSnapshot
+
+
+class OSINTBackend(ABC):
+    """Async OSINT data source for one social platform.
+
+    Implementations are expected to be safe for concurrent use within a single
+    asyncio event loop (the REPL drives one loop and may dispatch watch tasks
+    in parallel). They are NOT required to be process-safe.
+    """
+
+    # Capability tokens this backend exposes. Commands declare what they need
+    # via `@command(..., requires=("followed",))`; the dispatcher rejects the
+    # call when the active backend does not advertise the required tokens.
+    # HikerAPI exposes only public OSINT, so the default is empty.
+    # AiograpiBackend extends this with `{"followed", ...}`.
+    capabilities: frozenset[str] = frozenset()
+
+    @abstractmethod
+    async def resolve_target(self, username: str) -> str:
+        """Return the stable `pk` for `username`, or raise `ProfileNotFound`."""
+
+    @abstractmethod
+    async def get_profile(self, pk: str) -> Profile:
+        """Fetch the full profile DTO for `pk`."""
+
+    async def get_profile_by_username(self, username: str) -> Profile:
+        """Fetch the full profile DTO for `username`.
+
+        The default spends two requests (resolve, then read by pk). A backend
+        whose username lookup already answers with the full record overrides
+        this to spend one.
+        """
+        return await self.get_profile(await self.resolve_target(username))
+
+    @abstractmethod
+    async def get_user_about(self, pk: str) -> dict[str, Any]:
+        """Fetch the `user_about` payload (verification, dates, links)."""
+
+    @abstractmethod
+    def iter_user_posts(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate the user's feed posts in reverse chronological order."""
+
+    @abstractmethod
+    def iter_user_followers(self, pk: str, *, limit: int | None = None) -> AsyncIterator[User]:
+        """Iterate the user's followers."""
+
+    @abstractmethod
+    def iter_user_following(self, pk: str, *, limit: int | None = None) -> AsyncIterator[User]:
+        """Iterate accounts the user is following."""
+
+    @abstractmethod
+    def iter_user_tagged(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate posts the user is tagged in."""
+
+    @abstractmethod
+    def iter_user_highlights(
+        self, pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[Highlight]:
+        """Iterate highlight reels owned by the user."""
+
+    @abstractmethod
+    def iter_highlight_items(
+        self, highlight_id: str, *, limit: int | None = None
+    ) -> AsyncIterator[HighlightItem]:
+        """Iterate items inside a highlight reel."""
+
+    @abstractmethod
+    def iter_post_comments(
+        self, media_pk: str, *, limit: int | None = None
+    ) -> AsyncIterator[Comment]:
+        """Iterate comments on a post."""
+
+    @abstractmethod
+    def iter_post_likers(self, media_pk: str, *, limit: int | None = None) -> AsyncIterator[User]:
+        """Iterate users who liked a post."""
+
+    @abstractmethod
+    def iter_user_stories(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Story]:
+        """Iterate currently-active stories of a user."""
+
+    @abstractmethod
+    async def get_suggested(self, pk: str) -> list[User]:
+        """Fetch accounts suggested as similar to `pk`."""
+
+    @abstractmethod
+    def iter_hashtag_posts(self, tag: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate top / recent posts under a hashtag."""
+
+    def iter_search_users(self, query: str, *, limit: int | None = None) -> AsyncIterator[User]:
+        """Iterate accounts matching a free-text search query.
+
+        Backends that don't expose a search surface raise
+        ``BackendError`` from the iterator. Default is a `NotImplementedError`-
+        style stub — concrete backends override.
+        """
+        raise NotImplementedError(
+            "this backend does not implement search; override iter_search_users"
+        )
+
+    async def resolve_short_url(self, url: str) -> str:
+        """Resolve a short-link URL (e.g. ``instagram.com/share/...``) to
+        its canonical destination. Default raises — only logged-in
+        backends can hit the redirect surface without leaking the
+        target back to a public scraper-style request."""
+        raise NotImplementedError("this backend does not implement short-URL resolution")
+
+    def iter_audio_clips(self, track_id: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate clips that use a given audio asset. Default raises."""
+        raise NotImplementedError("this backend does not implement audio-clip listing")
+
+    async def get_recommended(self, pk: str) -> list[User]:
+        """Fetch IG's "recommended in same category" list for a target.
+        Different surface from :meth:`get_suggested` — this one is
+        category-based, only meaningful for business / creator accounts
+        with a category set. Default raises."""
+        raise NotImplementedError("this backend does not implement category-recommended lookup")
+
+    def iter_user_pinned(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate the user's pinned posts (max 3 on Instagram). Default raises."""
+        raise NotImplementedError("this backend does not implement pinned-media listing")
+
+    def iter_user_reposts(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate posts the user has reposted (IG's repost surface).
+        Default raises — only HikerAPI exposes this currently."""
+        raise NotImplementedError("this backend does not implement repost listing")
+
+    async def get_post_by_ref(self, ref: str) -> Post:
+        """Resolve a media reference (URL / shortcode / pk) to a `Post` DTO.
+
+        Caller passes any of: ``https://www.instagram.com/p/<code>/``,
+        the bare shortcode (e.g. ``DXPduuvEY7S``), or a numeric pk.
+        Backends decide which underlying call to use. Default raises.
+        """
+        raise NotImplementedError("this backend does not implement /postinfo lookup")
+
+    async def search_places(self, query: str, *, limit: int = 20) -> list[Place]:
+        """Free-text search for Instagram places (geo locations).
+
+        Returns a list of :class:`Place` DTOs ordered by IG's relevance
+        ranking. Default raises.
+        """
+        raise NotImplementedError("this backend does not implement place search")
+
+    def iter_place_posts(self, place_pk: str, *, limit: int | None = None) -> AsyncIterator[Post]:
+        """Iterate top posts at a given Instagram location pk. Default raises."""
+        raise NotImplementedError("this backend does not implement place media listing")
+
+    def iter_direct_threads(self, *, limit: int | None = None) -> AsyncIterator[DirectThread]:
+        """Iterate read-only Direct threads. Default requires aiograpi."""
+        raise BackendError("needs aiograpi backend")
+
+    def iter_direct_messages(
+        self, thread_id: str, *, limit: int | None = None
+    ) -> AsyncIterator[DirectMessage]:
+        """Iterate read-only Direct messages in one thread. Default requires aiograpi."""
+        raise BackendError("needs aiograpi backend")
+
+    def iter_saved_collections(self, *, limit: int | None = None) -> AsyncIterator[SavedCollection]:
+        """Iterate read-only saved-media collections. Default requires aiograpi."""
+        raise BackendError("needs aiograpi backend")
+
+    def iter_saved_posts(
+        self, *, collection: str | None = None, limit: int | None = None
+    ) -> AsyncIterator[Post]:
+        """Iterate read-only saved media. Default requires aiograpi."""
+        raise BackendError("needs aiograpi backend")
+
+    @abstractmethod
+    def get_quota(self) -> Quota:
+        """Return the last-known quota state for the backend."""
+
+    @abstractmethod
+    def get_last_error(self) -> BaseException | None:
+        """Return the last exception raised by this backend, if any."""
+
+    def get_schema_drift_count(self) -> int:
+        """Return the number of `SchemaDrift` errors observed this session.
+
+        Default 0 so simple backends (in-process fakes) need not track. Real
+        backends override to expose a running counter — surfaced by `/health`
+        so an operator can spot provider degradation.
+        """
+        return 0
+
+    def get_metrics(self) -> MetricsSnapshot:
+        """Return a snapshot of per-call latency / error metrics.
+
+        Default is an empty snapshot so backends that don't record (test
+        fakes) don't have to override. Real backends instrument their
+        `_call` boundary with `Metrics.record(...)` and return its
+        snapshot here — `/health` renders it.
+        """
+        return Metrics().snapshot()
+
+    async def aclose(self) -> None:  # noqa: B027 — intentional empty default
+        """Release backend-owned resources (HTTP clients, sockets, …).
+
+        Default implementation is a no-op so simple in-memory backends (the
+        test fakes, future mock backends) need not override. Real backends
+        with network clients (HikerBackend) override to close them.
+        """

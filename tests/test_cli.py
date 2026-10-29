@@ -1,0 +1,814 @@
+"""Tests for insto.cli: parser, setup wizard, completion, logging, _format_error."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import stat
+import sys
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from insto import cli as cli_mod
+from insto import config as cfgmod
+from insto.cli import (
+    LOG_FILENAME,
+    SETUP_HINT,
+    RedactingFormatter,
+    _format_error,
+    _print_completion,
+    _run_setup,
+    build_parser,
+    setup_logging,
+)
+from insto.commands import COMMANDS, CommandUsageError
+from insto.config import Config, config_file_path, load_config
+from insto.exceptions import (
+    AuthInvalid,
+    BackendError,
+    Banned,
+    PostNotFound,
+    PostPrivate,
+    ProfileBlocked,
+    ProfileDeleted,
+    ProfileNotFound,
+    ProfilePrivate,
+    QuotaExhausted,
+    RateLimited,
+    SchemaDrift,
+    Transient,
+)
+from insto.models import WatchSpec
+from insto.service.watch_lock import WatchLockBusyError
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
+    monkeypatch.setenv(cfgmod.CONFIG_HOME_ENV, str(tmp_path / ".insto"))
+    for var in (
+        "INSTO_BACKEND",
+        cfgmod.ENV_TOKEN,
+        cfgmod.ENV_PROXY,
+        cfgmod.ENV_OUTPUT_DIR,
+        cfgmod.ENV_DB_PATH,
+        cfgmod.ENV_AIOGRAPI_USERNAME,
+        cfgmod.ENV_AIOGRAPI_PASSWORD,
+        cfgmod.ENV_AIOGRAPI_TOTP,
+        "INSTO_WATCH_WEBHOOK_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    yield tmp_path
+    # Detach our log handlers to not bleed across tests.
+    insto_logger = logging.getLogger("insto")
+    for handler in list(insto_logger.handlers):
+        insto_logger.removeHandler(handler)
+        handler.close()
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
+def test_parser_defaults_no_args() -> None:
+    args = build_parser().parse_args([])
+    assert args.target is None
+    assert args.cmd_argv is None
+    assert args.print_completion is None
+    assert args.interactive is False
+    assert args.verbose is False
+    assert args.debug is False
+
+
+def test_parser_setup_positional() -> None:
+    args = build_parser().parse_args(["setup"])
+    assert args.target == "setup"
+    assert args.cmd_argv is None
+
+
+def test_parser_watch_daemon_positional() -> None:
+    args = build_parser().parse_args(["watch-daemon"])
+    assert args.target == "watch-daemon"
+    assert args.cmd_argv is None
+
+
+def test_parser_oneshot_target_and_cmd() -> None:
+    args = build_parser().parse_args(["@ferrari", "-c", "info", "--json"])
+    assert args.target == "@ferrari"
+    assert args.cmd_argv == ["info", "--json"]
+
+
+def test_parser_oneshot_remainder_preserves_flags() -> None:
+    args = build_parser().parse_args(["@x", "-c", "posts", "--limit", "5"])
+    assert args.cmd_argv == ["posts", "--limit", "5"]
+
+
+def test_parser_print_completion_choice() -> None:
+    args = build_parser().parse_args(["--print-completion", "bash"])
+    assert args.print_completion == "bash"
+
+
+def test_parser_verbose_and_debug() -> None:
+    args = build_parser().parse_args(["--debug", "@x", "-c", "info"])
+    assert args.debug is True
+    args = build_parser().parse_args(["-v"])
+    assert args.verbose is True
+
+
+def test_parser_proxy_flag() -> None:
+    args = build_parser().parse_args(["--proxy", "socks5h://127.0.0.1:9050"])
+    assert args.proxy == "socks5h://127.0.0.1:9050"
+
+
+def test_parser_hiker_token_flag() -> None:
+    """`--hiker-token` must override env/toml per spec §8."""
+    args = build_parser().parse_args(["--hiker-token", "abc123"])
+    assert args.hiker_token == "abc123"
+    args = build_parser().parse_args([])
+    assert args.hiker_token is None
+
+
+def test_parser_rejects_watch_webhook_url_flag() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--watch-webhook-url", "https://hooks.example.test/secret-hook"])
+
+
+def test_parser_backend_prefers_hikerapi_and_keeps_legacy_hiker_alias() -> None:
+    args = build_parser().parse_args(["--backend", "hikerapi"])
+    assert args.backend == "hikerapi"
+
+    legacy = build_parser().parse_args(["--backend", "hiker"])
+    assert legacy.backend == "hikerapi"
+
+
+def test_parser_backend_help_only_shows_public_backend_names(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--help"])
+
+    out = capsys.readouterr().out
+    assert "--backend {hikerapi,aiograpi}" in out
+    assert "--backend {hiker,aiograpi}" not in out
+
+
+def test_parsed_cmd_resolves_to_command_spec() -> None:
+    """`-c <name> ...` must round-trip through the command parser to a CommandSpec."""
+    from insto.commands._base import parse_command_line
+
+    args = build_parser().parse_args(["@ferrari", "-c", "info", "--json"])
+    assert args.cmd_argv is not None
+    line = " ".join(args.cmd_argv)
+    spec, parsed = parse_command_line(line)
+    assert spec.name == "info"
+    assert spec is COMMANDS["info"]
+    assert parsed.json == ""
+
+
+# ---------------------------------------------------------------------------
+# _format_error
+# ---------------------------------------------------------------------------
+
+
+def test_format_error_profile_not_found() -> None:
+    assert _format_error(ProfileNotFound("ferrari")) == "profile not found: @ferrari"
+
+
+def test_format_error_profile_private() -> None:
+    assert _format_error(ProfilePrivate("ferrari")) == "profile is private: @ferrari"
+
+
+def test_format_error_profile_blocked() -> None:
+    assert _format_error(ProfileBlocked("x")) == "profile has blocked us: @x"
+
+
+def test_format_error_profile_deleted() -> None:
+    assert _format_error(ProfileDeleted("x")) == "profile is deleted: @x"
+
+
+def test_format_error_post_not_found() -> None:
+    assert _format_error(PostNotFound("MEDIA1")) == "post not found: MEDIA1"
+
+
+def test_format_error_post_private() -> None:
+    assert _format_error(PostPrivate("MEDIA1")) == "post is private: MEDIA1"
+
+
+def test_format_error_auth_invalid_mentions_setup() -> None:
+    msg = _format_error(AuthInvalid())
+    assert "auth invalid" in msg
+    assert "insto setup" in msg
+
+
+def test_format_error_quota_exhausted() -> None:
+    assert "quota exhausted" in _format_error(QuotaExhausted())
+
+
+def test_format_error_rate_limited() -> None:
+    assert _format_error(RateLimited(7.5)) == "rate limited — retry after 7.5s"
+
+
+def test_format_error_schema_drift() -> None:
+    msg = _format_error(SchemaDrift("/v1/profile", "username"))
+    assert "/v1/profile" in msg
+    assert "username" in msg
+
+
+def test_format_error_transient() -> None:
+    assert _format_error(Transient("network blip")) == "transient backend error: network blip"
+
+
+def test_format_error_banned() -> None:
+    assert "banned" in _format_error(Banned())
+
+
+def test_format_error_generic_backend() -> None:
+    assert _format_error(BackendError("weird")) == "backend error: weird"
+
+
+def test_format_error_command_usage() -> None:
+    assert _format_error(CommandUsageError("missing target")) == "usage: missing target"
+
+
+def test_format_error_unknown_exception_type() -> None:
+    assert "RuntimeError" in _format_error(RuntimeError("boom"))
+
+
+def test_format_error_redacts_env_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HIKERAPI_TOKEN", "supersecrettoken1234")
+    err = BackendError("upstream said: token=supersecrettoken1234 expired")
+    out = _format_error(err)
+    assert "supersecrettoken1234" not in out
+    assert "***" in out
+
+
+def test_format_error_redacts_query_string() -> None:
+    err = BackendError("fetch failed: https://cdn.example.com/x.jpg?signature=abcDEFsig123&size=1")
+    out = _format_error(err)
+    assert "abcDEFsig123" not in out
+    assert "signature=***" in out
+
+
+# ---------------------------------------------------------------------------
+# Setup wizard
+# ---------------------------------------------------------------------------
+
+
+def _scripted_prompt(answers: list[str]) -> Callable[[str], str]:
+    iterator = iter(answers)
+
+    def prompt(_text: str) -> str:
+        return next(iterator)
+
+    return prompt
+
+
+def test_setup_writes_0600_with_token_and_proxy(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = _run_setup(
+        prompt=_scripted_prompt(
+            [
+                "",  # backend (Enter = default 'hiker')
+                "tok-1234567890",  # token
+                "./out-x",  # output_dir
+                "/tmp/insto-store.db",  # db_path
+                "socks5h://127.0.0.1:9050",  # proxy
+            ]
+        )
+    )
+    assert rc == 0
+    path = config_file_path()
+    assert path.exists()
+    assert _mode(path) == 0o600
+    leaked = path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+    assert leaked == 0
+    cfg = load_config()
+    assert cfg.hiker_token == "tok-1234567890"
+    assert cfg.hiker_proxy == "socks5h://127.0.0.1:9050"
+    # Setup wizard resolves user input to absolute paths so behaviour does
+    # not depend on the CWD where `insto` is later invoked from.
+    assert cfg.output_dir.is_absolute()
+    assert cfg.output_dir.name == "out-x"
+    # Path("/tmp/...").resolve() expands the macOS /tmp -> /private/tmp symlink.
+    assert cfg.db_path == Path("/tmp/insto-store.db").resolve()
+
+
+def test_setup_keeps_existing_token_when_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfgmod.write_config({"hiker": {"token": "existing-token-9999"}})
+    # Five Enters: backend / token / output_dir / db_path / proxy — all default.
+    rc = _run_setup(prompt=_scripted_prompt(["", "", "", "", ""]))
+    assert rc == 0
+    cfg = load_config()
+    assert cfg.hiker_token == "existing-token-9999"
+
+
+def test_setup_hiker_token_prompt_links_to_hikerapi_tokens() -> None:
+    prompts: list[str] = []
+    answers = iter(["", "tok-1234567890", "", "", ""])
+
+    def prompt(text: str) -> str:
+        prompts.append(text)
+        return next(answers)
+
+    rc = _run_setup(prompt=prompt)
+
+    assert rc == 0
+    assert "backend (hikerapi | aiograpi) [hikerapi]" in prompts[0]
+    token_prompt = next(text for text in prompts if text.startswith("hikerapi.token"))
+    assert "https://hikerapi.com/tokens" in token_prompt
+
+
+def test_setup_aiograpi_warns_when_optional_dependency_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli_mod, "_is_aiograpi_installed", lambda: False)
+
+    rc = _run_setup(
+        prompt=_scripted_prompt(
+            [
+                "aiograpi",
+                "instag",
+                "secret",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "aiograpi backend requested" in out
+    assert "pipx inject insto aiograpi" in out
+    assert "insto[aiograpi]" in out
+    assert load_config().backend == "aiograpi"
+
+
+def test_setup_writes_hikerapi_backend_and_section() -> None:
+    rc = _run_setup(prompt=_scripted_prompt(["", "tok-1234567890", "", "", ""]))
+
+    assert rc == 0
+    contents = config_file_path().read_text()
+    assert 'backend = "hikerapi"' in contents
+    assert "[hikerapi]" in contents
+    assert "[hiker]" not in contents
+
+
+def test_setup_clear_proxy_with_dash() -> None:
+    cfgmod.write_config(
+        {"hiker": {"token": "tok-abcd1234", "proxy": "http://prev:1"}, "output_dir": "./o"}
+    )
+    rc = _run_setup(prompt=_scripted_prompt(["", "", "", "", "-"]))
+    assert rc == 0
+    cfg = load_config()
+    assert cfg.hiker_proxy is None
+
+
+def test_setup_without_token_emits_hint(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = _run_setup(prompt=_scripted_prompt(["", "", "", "", ""]))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert SETUP_HINT in out
+
+
+# ---------------------------------------------------------------------------
+# Shell completion
+# ---------------------------------------------------------------------------
+
+
+def test_print_completion_without_shtab(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(sys.modules, "shtab", None)
+    rc = _print_completion(build_parser(), "bash")
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "shell completion requires" in err
+    assert "insto[completion]" in err
+
+
+def test_print_completion_with_shtab(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import types
+
+    fake = types.ModuleType("shtab")
+
+    def fake_complete(parser: object, shell: str = "bash") -> str:
+        assert shell in ("bash", "zsh")
+        return f"# completion script for {shell}"
+
+    fake.complete = fake_complete  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "shtab", fake)
+    rc = _print_completion(build_parser(), "zsh")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "completion script for zsh" in out
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+def test_setup_logging_creates_0600_file(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_path = setup_logging(logging.INFO, log_dir=log_dir)
+    assert log_path == log_dir / LOG_FILENAME
+    log = logging.getLogger("insto.test")
+    log.info("hello world")
+    for handler in logging.getLogger("insto").handlers:
+        handler.flush()
+    assert log_path.exists()
+    assert _mode(log_path) == 0o600
+    assert _mode(log_dir) == 0o700
+
+
+def test_setup_logging_debug_records_debug_lines(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_path = setup_logging(logging.DEBUG, log_dir=log_dir)
+    log = logging.getLogger("insto.test")
+    log.debug("debug line one")
+    log.info("info line one")
+    for handler in logging.getLogger("insto").handlers:
+        handler.flush()
+    contents = log_path.read_text()
+    assert "debug line one" in contents
+    assert "info line one" in contents
+
+
+def test_setup_logging_info_skips_debug(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_path = setup_logging(logging.INFO, log_dir=log_dir)
+    log = logging.getLogger("insto.test")
+    log.debug("hidden debug")
+    log.info("visible info")
+    for handler in logging.getLogger("insto").handlers:
+        handler.flush()
+    contents = log_path.read_text()
+    assert "hidden debug" not in contents
+    assert "visible info" in contents
+
+
+def test_log_redaction_strips_secrets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HIKERAPI_TOKEN", "log-token-1234567890")
+    log_dir = tmp_path / "logs"
+    log_path = setup_logging(logging.DEBUG, log_dir=log_dir)
+    log = logging.getLogger("insto.test")
+    log.warning("dumping token=log-token-1234567890 for debugging")
+    log.warning("cdn url: https://cdn.x/?signature=abcDEFsig987")
+    for handler in logging.getLogger("insto").handlers:
+        handler.flush()
+    contents = log_path.read_text()
+    assert "log-token-1234567890" not in contents
+    assert "abcDEFsig987" not in contents
+    assert "***" in contents
+
+
+def test_log_rotation_5mb_threshold(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_path = setup_logging(logging.INFO, log_dir=log_dir)
+    log = logging.getLogger("insto.test")
+    big = "x" * 1024
+    # Write >5MB so the rotating handler triggers a rollover.
+    for _ in range(6 * 1024):
+        log.info(big)
+    for handler in logging.getLogger("insto").handlers:
+        handler.flush()
+    rotated = log_dir / f"{LOG_FILENAME}.1"
+    assert rotated.exists()
+    assert log_path.exists()
+    assert log_path.stat().st_size <= cli_mod.LOG_MAX_BYTES * 1.1
+
+
+def test_redacting_formatter_directly() -> None:
+    fmt = RedactingFormatter("%(message)s")
+    record = logging.LogRecord(
+        name="insto.test",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="cdn https://cdn.x/p?signature=abcDEF1234sig and more",
+        args=None,
+        exc_info=None,
+    )
+    out = fmt.format(record)
+    assert "abcDEF1234sig" not in out
+    assert "signature=***" in out
+
+
+# ---------------------------------------------------------------------------
+# main() integration: hint when no token
+# ---------------------------------------------------------------------------
+
+
+def test_main_oneshot_no_token_prints_hint(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = cli_mod.main(["@ferrari", "-c", "info"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert SETUP_HINT in err
+
+
+def test_main_no_args_no_token_prints_hint_and_exits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = cli_mod.main([])
+    err = capsys.readouterr().err
+    assert SETUP_HINT in err
+    assert rc == 1
+
+
+def test_main_aiograpi_backend_does_not_require_hikerapi_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import insto.repl as repl_mod
+
+    cfgmod.write_config(
+        {
+            "backend": "aiograpi",
+            "aiograpi": {"username": "instag", "password": "secret"},
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_run_repl(config: Any = None, *, target: str | None = None) -> None:
+        captured["backend"] = config.backend
+        captured["target"] = target
+
+    monkeypatch.setattr(repl_mod, "run_repl", fake_run_repl)
+
+    rc = cli_mod.main([])
+
+    assert rc == 0
+    assert captured == {"backend": "aiograpi", "target": None}
+
+
+def test_main_setup_invokes_wizard(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: dict[str, Any] = {}
+
+    def fake_run_setup(*, non_interactive: bool = False) -> int:
+        called["yes"] = True
+        called["non_interactive"] = non_interactive
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_setup", fake_run_setup)
+    rc = cli_mod.main(["setup"])
+    assert rc == 0
+    assert called.get("yes") is True
+    assert called.get("non_interactive") is False
+
+
+def test_main_routes_bare_watch_daemon_before_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import insto.repl as repl_mod
+
+    monkeypatch.setenv("HIKERAPI_TOKEN", "tok-daemon-1234567890")
+    captured: dict[str, Any] = {}
+
+    async def fake_run_watch_daemon(config: Any, log: logging.Logger) -> int:
+        captured["backend"] = config.backend
+        captured["logger"] = log.name
+        return 7
+
+    def unexpected_repl(*args: object, **kwargs: object) -> None:
+        pytest.fail("bare watch-daemon was routed to the REPL")
+
+    monkeypatch.setattr(cli_mod, "_run_watch_daemon", fake_run_watch_daemon)
+    monkeypatch.setattr(repl_mod, "run_repl", unexpected_repl)
+
+    assert cli_mod.main(["watch-daemon"]) == 7
+    assert captured == {"backend": "hikerapi", "logger": "insto.cli"}
+
+
+def test_main_keeps_at_watch_daemon_as_oneshot_username(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_oneshot(
+        cmd_argv: list[str],
+        target: str | None,
+        proxy: str | None,
+        hiker_token: str | None,
+        log: logging.Logger,
+    ) -> int:
+        captured.update(cmd=cmd_argv, target=target)
+        return 0
+
+    async def unexpected_daemon(config: Any, log: logging.Logger) -> int:
+        pytest.fail("@watch-daemon was treated as the reserved daemon command")
+
+    monkeypatch.setattr(cli_mod, "_run_oneshot", fake_run_oneshot)
+    monkeypatch.setattr(cli_mod, "_run_watch_daemon", unexpected_daemon)
+
+    assert cli_mod.main(["@watch-daemon", "-c", "info"]) == 0
+    assert captured == {"cmd": ["info"], "target": "@watch-daemon"}
+
+
+def test_run_watch_daemon_reports_load_and_stops_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from insto.service import runtime as runtime_mod
+
+    class Coordinator:
+        async def run(self, stop_event: asyncio.Event) -> None:
+            stop_event.set()
+
+    class Manager:
+        def __len__(self) -> int:
+            return 1
+
+    spec = WatchSpec("alice", "reg-1", 300)
+    history = SimpleNamespace(list_watches_async=lambda: asyncio.sleep(0, result=[spec]))
+    runtime = SimpleNamespace(coordinator=Coordinator(), history=history, manager=Manager())
+
+    @asynccontextmanager
+    async def fake_open_runtime(*args: object, **kwargs: object) -> AsyncIterator[Any]:
+        yield runtime
+
+    monkeypatch.setattr(runtime_mod, "open_runtime", fake_open_runtime)
+    config = Config(
+        hiker_token="tok-daemon-1234567890",
+        output_dir=tmp_path / "out",
+        db_path=tmp_path / "store.db",
+    )
+
+    rc = asyncio.run(cli_mod._run_watch_daemon(config, logging.getLogger("test")))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert str(config.db_path) in out
+    assert "recovered active watches: 1" in out
+    assert "12 ticks/hour" in out
+    assert "24 to 36 backend calls/hour" in out
+    assert "quota" in out and "cost" in out
+
+
+def test_run_watch_daemon_maps_lock_contention_to_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from insto.service import runtime as runtime_mod
+
+    @asynccontextmanager
+    async def busy_runtime(*args: object, **kwargs: object) -> AsyncIterator[Any]:
+        raise WatchLockBusyError("watch executor already active")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(runtime_mod, "open_runtime", busy_runtime)
+    config = Config(hiker_token="token", db_path=tmp_path / "store.db")
+
+    rc = asyncio.run(cli_mod._run_watch_daemon(config, logging.getLogger("test")))
+
+    assert rc == 1
+    assert capsys.readouterr().err.strip() == "watch executor already active"
+
+
+def test_run_watch_daemon_maps_runtime_failure_to_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from insto.service import runtime as runtime_mod
+
+    @asynccontextmanager
+    async def broken_runtime(*args: object, **kwargs: object) -> AsyncIterator[Any]:
+        raise RuntimeError("registry unavailable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(runtime_mod, "open_runtime", broken_runtime)
+    config = Config(hiker_token="token", db_path=tmp_path / "store.db")
+
+    rc = asyncio.run(cli_mod._run_watch_daemon(config, logging.getLogger("test")))
+
+    assert rc == 1
+    assert capsys.readouterr().err.strip() == "RuntimeError: registry unavailable"
+
+
+def test_main_setup_non_interactive_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run_setup(*, non_interactive: bool = False) -> int:
+        captured["non_interactive"] = non_interactive
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_run_setup", fake_run_setup)
+    rc = cli_mod.main(["--non-interactive", "setup"])
+    assert rc == 0
+    assert captured["non_interactive"] is True
+
+
+def test_main_print_completion_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_print_completion(parser: object, shell: str) -> int:
+        captured["shell"] = shell
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_print_completion", fake_print_completion)
+    rc = cli_mod.main(["--print-completion", "zsh"])
+    assert rc == 0
+    assert captured["shell"] == "zsh"
+
+
+# ---------------------------------------------------------------------------
+# REPL launch wiring — `insto @user` threads the positional into run_repl
+# ---------------------------------------------------------------------------
+
+
+def test_main_passes_positional_target_to_run_repl(monkeypatch: pytest.MonkeyPatch) -> None:
+    import insto.repl as repl_mod
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_repl(
+        config: Any = None, *, email: str | None = None, target: str | None = None
+    ) -> None:
+        captured["target"] = target
+
+    monkeypatch.setattr(repl_mod, "run_repl", fake_run_repl)
+    # --interactive forces the REPL path even without a configured token.
+    rc = cli_mod.main(["@ferrari", "--interactive"])
+    assert rc == 0
+    assert captured["target"] == "@ferrari"
+
+
+# ---------------------------------------------------------------------------
+# One-shot dispatch (`insto <target> -c <cmd>`)
+# ---------------------------------------------------------------------------
+
+
+def test_run_oneshot_dispatches_against_fake_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from insto.models import Profile
+    from tests.fakes import FakeBackend
+
+    monkeypatch.setenv("HIKERAPI_TOKEN", "tok-oneshot-123456")
+    monkeypatch.setenv("INSTO_OUTPUT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("INSTO_DB_PATH", str(tmp_path / "store.db"))
+    fake = FakeBackend(profiles={"1": Profile(pk="1", username="alice", access="public")})
+    monkeypatch.setattr(cli_mod, "_build_backend", lambda config: fake)
+
+    rc = cli_mod.main(["alice", "-c", "info"])
+    assert rc == 0
+    # the command actually ran against the fake
+    assert any(name == "get_profile" for name, _ in fake.request_log)
+
+
+def test_run_oneshot_hiker_without_token_emits_hint(capsys: pytest.CaptureFixture[str]) -> None:
+    # backend defaults to hiker; no token configured -> setup hint, rc 1.
+    rc = cli_mod.main(["alice", "-c", "info"])
+    assert rc == 1
+    assert SETUP_HINT in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive setup (`insto setup --non-interactive`)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_non_interactive_hiker_writes_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HIKERAPI_TOKEN", "tok-ni-1234567890")
+    rc = cli_mod.main(["setup", "--non-interactive"])
+    assert rc == 0
+    assert load_config().hiker_token == "tok-ni-1234567890"
+
+
+def test_setup_non_interactive_missing_token_fails(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = cli_mod.main(["setup", "--non-interactive"])  # no token in env or config
+    assert rc == 2
+    assert "HIKERAPI_TOKEN" in capsys.readouterr().err
+
+
+def test_setup_non_interactive_aiograpi_warns_when_optional_dependency_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli_mod, "_is_aiograpi_installed", lambda: False)
+    monkeypatch.setenv("INSTO_BACKEND", "aiograpi")
+    monkeypatch.setenv("AIOGRAPI_USERNAME", "instag")
+    monkeypatch.setenv("AIOGRAPI_PASSWORD", "secret")
+
+    rc = cli_mod.main(["setup", "--non-interactive"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "pipx inject insto aiograpi" in out
+    assert load_config().backend == "aiograpi"

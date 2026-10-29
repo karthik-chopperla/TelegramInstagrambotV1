@@ -1,0 +1,227 @@
+# Architecture
+
+The macOS user-service adapter in `service/watch_service.py` owns only
+LaunchAgent installation, inspection, and removal. It never implements polling
+or constructs a provider backend. A private manifest pins the installed
+interpreter/backend/data paths. `watch_service_runner.py` validates explicit
+credential files, clears ambient application/network settings, and invokes
+the same foreground daemon with a private rotating output sink.
+
+```text
+watch-service install -> owned manifest/plist -> launchd
+                                                |
+                                      private service runner
+                                                |
+                             existing daemon -> executor lock -> watches
+
+watch-service status -> launchctl observations + read-only SQLite query
+```
+
+Service status does not instantiate `HistoryStore` (its constructor migrates
+and initializes files). The dedicated read-only query reuses watch-row decoding
+without writes. `launchctl print` fields are best-effort diagnostics and never
+authorize process signaling, removal, or health claims. Mutations are serialized
+by a separate management lock; uninstall never removes the executor lock inode.
+
+Six layers, top to bottom. The rule that holds the design together: each layer talks DTOs to the layer below, never raw API dicts.
+
+```text
+UI:        REPL (prompt_toolkit) │ one-shot CLI │ foreground watch daemon
+Dispatch:  parse → validate → run → render
+Commands:  commands/{target,profile,media,network,content,interactions,discovery,
+                    direct,saved,places,batch,watch,operational,dossier}.py
+Service:   runtime · facade · history · analytics · exporter · watch_daemon · watch · watch_lock · watch_webhook
+Backends:  OSINTBackend ABC · HikerBackend · AiograpiBackend
+Models:    @dataclass(slots=True) DTOs — Profile, Post, Story, User, Comment, Quota, ...
+```
+
+## Conventions
+
+- **Async everywhere.** `httpx` (transitive via `hikerapi`), `asyncio` for fan-out, `asyncio.to_thread` for sqlite calls.
+- **Backend boundary is a hard wall.** Raw HikerAPI / aiograpi dicts never leave `backends/`. Mappers in `_hiker_map.py` and `_aiograpi_map.py` are the only converters.
+- **Lazy backend imports.** `import hikerapi` and `import aiograpi` happen only inside `make_backend(...)`. Missing optional dependencies stay localized and surface with install hints.
+- **Retry / backoff lives in one place.** `backends/_retry.py` decorates SDK-method calls inside `HikerBackend`; commands never know retries exist.
+- **CDN streaming through a single helper.** `backends/_cdn.py` is the only code that pulls untrusted bytes off the network. Host allowlist, MIME sniff, byte budget, atomic write — every download passes through it.
+- **Pagination as `AsyncIterator[T]` + `limit: int | None`.** Every collection method is an async generator. Cursor management lives inside the backend; commands consume one item at a time and stop on `limit`.
+- **Identity by `pk`, not username.** Usernames are mutable; `Profile.previous_usernames` accumulates renames. The session caches `username → pk` so a typo fails fast and downstream commands don't re-resolve.
+
+## Errors
+
+`insto/exceptions.py` defines the taxonomy. Every backend error subclasses `BackendError`:
+
+| Exception | Retryable? | User-visible message via `_format_error` |
+|---|---|---|
+| `ProfileNotFound` | no | `profile not found: @<user>` |
+| `ProfilePrivate` | no | `profile is private: @<user>` |
+| `ProfileBlocked` | no | `profile blocked: @<user>` (aiograpi) |
+| `ProfileDeleted` | no | `account no longer exists: @<user>` |
+| `PostNotFound` / `PostPrivate` | no | similarly direct |
+| `AuthInvalid` | no | `auth invalid — refresh your token / re-login` |
+| `QuotaExhausted` | no, terminal | `HikerAPI quota exhausted` |
+| `RateLimited(retry_after)` | yes | sleeps `retry_after` and retries |
+| `Transient` | yes | exponential backoff + jitter |
+| `SchemaDrift(endpoint, field)` | no | `schema drift in <endpoint>: missing field "<f>"` |
+| `Banned` | no | account-level block (aiograpi) |
+
+Commands never `except BackendError` themselves. The dispatcher catches everything at the boundary, runs `_format_error` (which redacts secrets via `_redact.redact_secrets`), and prints a single line. The same redactor runs in the rotating-file logger so stack traces in `~/.insto/logs/insto.log` are also scrubbed.
+
+## Sqlite store
+
+All persistent state lives in one DB at `~/.insto/store.db` (mode `0600`):
+
+```text
+_meta             schema_version, first_check_attempted:<user>
+cli_history       cmd, target, ts            (90-day retention, indexed on ts)
+watches           user, registration_id, interval_seconds, last_ok, last_error,
+                  consecutive_errors, status
+snapshots         target_pk, captured_at, profile_fields_json, last_post_pks_json,
+                  avatar_url_hash, banner_url_hash    (30-day retention, max 100/target)
+```
+
+- One `sqlite3.Connection` per session, owned by the facade.
+- `asyncio.to_thread` wraps every sync call from async contexts so the event loop never blocks.
+- `migrate_to_latest()` runs on startup under `BEGIN IMMEDIATE` so two `insto` processes don't race a schema bump.
+- Avatar / banner URLs are SHA256-hashed before write — diffing checks hash inequality, never the URL.
+  The digest covers the media identity (the last path segment of the CDN URL), not the whole URL: the
+  edge host and the signed `oh` / `oe` / `_nc_ohc` / `stp` parameters are re-issued on every fetch, so a
+  whole-URL digest changed on every check. What the evidence covers is that rotation; whether an
+  HD/non-HD fallback can change the file name is unverified, and would cost one false change per flip.
+- Rows written before that change hold whole-URL digests and cannot be recomputed (the URLs are not
+  stored), so each snapshot records which algorithm hashed it: `snapshot_from_profile` writes
+  `_media_hash_algo` into `profile_fields_json`. It is a per-row sentinel, not a `_meta` moment and not
+  a column, so `schema_version` stays 2 and an older insto sharing the same `~/.insto/store.db` —
+  the CLI on PyPI keeps writing whole-URL digests after the desktop app upgrades — cannot be mistaken
+  for a new-algorithm writer. Every comparison — `/diff`, the `/watch` notification and the webhook,
+  and the desktop `snapshots.compare` / `changes.list` — reports an avatar or banner difference only
+  when *both* rows carry the current sentinel; otherwise the pair is silently not comparable and
+  appears neither as a change nor as an unknown field. `snapshots.read` is not gated: it reports the
+  stored digest as it is. The sentinel never leaves the store: every reader iterates the tracked
+  profile fields, and the read-only record validator skips unknown keys rather than rejecting them.
+
+## Output / export
+
+```text
+output/
+  <user>/
+    info.json
+    posts.json
+    posts/<pk>.<ext>
+    stories/<pk>.<ext>
+    highlights/<highlight_pk>/<item_pk>.<ext>
+    dossier/<iso_ts>/...     (one self-contained intel package per /dossier run)
+  .batch-<sha>.jsonl         (per-input-file resume state)
+  .insto-cdn-budget.lock     (per-command 5 GB CDN ceiling)
+```
+
+JSON exports are versioned: every file has `{"_schema": "insto.v1", "command": ..., "target": ..., "captured_at": ..., "data": ...}`. CSV is flat rows with no envelope. Maltego CSV uses `Type, Value, Weight, Properties` with Properties JSON-encoded into one column.
+
+`mtime` of every downloaded media file is set from the source's `taken_at` so Photos / Finder sort chronologically.
+
+## Watch
+
+SQLite is the source of truth; the local scheduler is disposable execution
+state. `/watch` and `/unwatch` transactionally mutate the registry. A
+`WatchDaemon` reconciles it every two seconds into a `WatchManager`, which owns
+one task per active target and the only `WatchProcessLock` for that database.
+
+```text
+/watch, /unwatch, /watching
+          |
+          v
+ SQLite registry <---------------------------+
+          |                                   |
+          | reconcile                         | conditional state update
+          v                                   | (user + registration_id)
+ WatchDaemon -> WatchManager -> diff_and_snapshot
+                     |
+                     +-- <db>.watch.lock (one executor)
+```
+
+One-shot mode only controls persisted rows. REPL mode attempts ownership lazily
+and remains control-only when another executor owns the lock. `insto
+watch-daemon` acquires before recovery and keeps ownership even with zero rows.
+All three entrypoints use `service/runtime.py`, which constructs and closes the
+history store, backend, CDN client, facade, manager, and coordinator in one
+order-controlled lifecycle.
+
+`registration_id` is an opaque generation token: a stale in-flight tick cannot
+update a row that was deleted and re-added. It is never exposed in terminal or
+JSON output. In the headless daemon (`insto watch-daemon` and the managed
+LaunchAgent) a registration that has never been checked and carries no error is
+checked right away, so adding an account does something visible instead of
+waiting a full interval; a never-succeeded row that already failed keeps the
+full interval. That grant is made at most once per registered user and is
+recorded durably *before* the zero-delay task is scheduled, as a
+`first_check_attempted:<user>` row in the generic `_meta` key/value table (no
+schema column, no version bump). The marker survives pause/resume, interval
+edits, `registration_id` rotations and daemon restarts, so none of them buys a
+second paid check and a crash or restart loop cannot spend quota on every start;
+it is dropped only when a reconcile observes that the watch row itself is gone,
+so a genuine remove + add is checked promptly again. A marker that cannot be
+written means no immediate check: the row falls back to its interval rather than
+running a paid check nobody could record. The REPL role neither reads nor writes
+markers and a new row there still waits one interval. Zero delays — new and
+recovered due rows alike — start at offsets 0/2/4 seconds, in the recovery pass
+and in a steady-state pass that schedules several at once. Subsequent polling is
+fixed-delay, so one target never overlaps itself.
+
+A tick retries once. Two consecutive failed ticks persist `paused`, including
+across restarts; `Banned` and `AuthInvalid` pause immediately. Success clears the
+error and counter. Coordinator/storage failures are fatal to the executor and
+drain all tasks. SIGINT/SIGTERM shutdown drains reconcile and tick tasks before
+clients, sqlite, and the POSIX advisory lock are released.
+Concurrent removal and shutdown paths share one drain per watch; entries stay
+registered until their tasks finish, so an empty registry cannot release the
+executor while another caller is still draining a tick.
+
+The foreground daemon runs best-effort retention at startup and hourly using
+`HistoryStore.prune_async()`. Its supervised maintenance task finishes any
+started SQLite operation before shutdown closes the store. Retention failures
+do not pause watches and are retried at the next interval. Daemon output is
+flushed per message so service managers and redirected logs see it immediately.
+
+Limits remain three active watches and a 300-second floor: at the ceiling this
+is 36 ticks/hour and an estimated 72-108 backend calls/hour. The lock/signal
+implementation is POSIX-only.
+
+### Webhook delivery
+
+The runtime creates a webhook notifier only for persistent REPL and daemon
+roles. One-shot mode does not validate or allocate it. Delivery is downstream
+of the existing persistence and terminal-output boundaries:
+
+```text
+WatchManager -> diff_and_snapshot -> SQLite snapshot
+                                |
+                                +-> terminal output
+                                `-> build event -> bounded webhook retry -> warning only
+```
+
+Event conversion permits delivery only for non-empty current `changes`;
+historical `previous_usernames` is context and cannot trigger it. The immutable
+version-1 payload contains only `schema_version`, `event`, `event_id`,
+`username`, `observed_at`, `changes`, and `previous_usernames`. One event id is
+reused for every attempt.
+
+The notifier's pooled HTTP client has redirects disabled and `trust_env=False`.
+It treats `2xx` as success; transport errors, timeouts, `408`, `429`, and `5xx`
+get three total attempts separated by 0.25 and 1 second. Other `4xx` and all
+`3xx` responses fail after one attempt. A hard five-second timeout bounds each
+attempt, and streamed response bodies are closed without being read or logged.
+The endpoint is environment-only, secret-redacted, never persisted, and limited
+to HTTPS except for localhost and loopback HTTP.
+
+Delivery is observational: its final failure emits a sanitized warning without
+changing successful watch state. This is best-effort rather than transactional
+delivery. Receivers deduplicate possible retries with `event_id`; a crash after
+the snapshot commit and before delivery can lose an event because there is no
+outbox.
+
+## Test strategy
+
+- 900+ unit + integration tests, no live API calls in CI.
+- Fixtures: one frozen HikerAPI dict per profile-access state (`public`, `private`, `deleted`, `empty`, `schema_drift`).
+- `tests/fakes.py:FakeBackend` implements `OSINTBackend` from fixtures with per-method error injection covering every entry of the error taxonomy.
+- E2E flows cover subprocess one-shot, prompt_toolkit REPL, a local watch tick,
+  and daemon persistence/lock/SIGTERM/restart behavior with an offline backend.
+- Strict mypy + ruff format + ruff lint as CI gates; pytest coverage must stay at or above the current CI floor.

@@ -1,0 +1,398 @@
+"""Tests for persistent-state scheduling in `WatchManager`."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from pathlib import Path
+
+import pytest
+
+from insto.exceptions import Banned, Transient
+from insto.models import WatchSpec
+from insto.service.watch import WatchError, WatchManager
+from insto.service.watch_lock import WatchLockBusyError, WatchProcessLock
+
+
+def _spec(
+    user: str = "alice",
+    *,
+    registration_id: str = "reg-1",
+    interval: int = 300,
+    last_ok: int | None = None,
+    last_error: str | None = None,
+    consecutive_errors: int = 0,
+) -> WatchSpec:
+    return WatchSpec(
+        user=user,
+        registration_id=registration_id,
+        interval_seconds=interval,
+        last_ok=last_ok,
+        last_error=last_error,
+        consecutive_errors=consecutive_errors,
+    )
+
+
+def _manager(tmp_path: Path, *, release_when_empty: bool = False) -> WatchManager:
+    return WatchManager(
+        WatchProcessLock(tmp_path / "store.db"),
+        release_when_empty=release_when_empty,
+        now=lambda: 1234,
+    )
+
+
+async def _accept(_: WatchSpec) -> bool:
+    return True
+
+
+async def test_manager_requires_executor_and_rejects_duplicates(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+
+    async def tick() -> None:
+        return None
+
+    with pytest.raises(WatchError, match="executor"):
+        manager.add(_spec(), tick=tick, state_changed=_accept, start=False)
+
+    manager.acquire_executor()
+    manager.add(_spec(), tick=tick, state_changed=_accept, start=False)
+    with pytest.raises(WatchError, match="already watching"):
+        manager.add(_spec(), tick=tick, state_changed=_accept, start=False)
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+async def test_recovered_failure_streak_pauses_on_next_failed_tick(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    seen: list[WatchSpec] = []
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+        raise Transient("network blip")
+
+    async def state_changed(spec: WatchSpec) -> bool:
+        seen.append(spec)
+        return True
+
+    manager.add(
+        _spec(consecutive_errors=1),
+        tick=tick,
+        state_changed=state_changed,
+        start=False,
+    )
+    updated = await manager.tick_once("alice")
+
+    assert calls == 2
+    assert updated.status == "paused"
+    assert updated.consecutive_errors == 2
+    assert "network blip" in (updated.last_error or "")
+    assert seen == [updated]
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+async def test_success_resets_recovered_error_state(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    seen: list[WatchSpec] = []
+
+    async def tick() -> None:
+        return None
+
+    async def state_changed(spec: WatchSpec) -> bool:
+        seen.append(spec)
+        return True
+
+    manager.add(
+        _spec(last_error="old", consecutive_errors=1),
+        tick=tick,
+        state_changed=state_changed,
+        start=False,
+    )
+    updated = await manager.tick_once("alice")
+
+    assert updated.last_ok == 1234
+    assert updated.last_error is None
+    assert updated.consecutive_errors == 0
+    assert seen == [updated]
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+@pytest.mark.parametrize("recovery", ["raise-cap", "utc-reset"])
+@pytest.mark.parametrize("prior_errors", [0, 1])
+async def test_daily_budget_waits_without_pausing_and_recovers(
+    tmp_path: Path, recovery: str, prior_errors: int
+) -> None:
+    from insto.service.usage import UsageLedger
+
+    moment = 86401
+    ledger = UsageLedger(tmp_path / "usage.db", clock=lambda: moment)
+    await ledger.configure(1)
+    await ledger.reserve()
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+        await ledger.reserve()
+
+    initial = _spec(
+        last_ok=1000,
+        last_error="earlier failure" if prior_errors else None,
+        consecutive_errors=prior_errors,
+    )
+    manager.add(initial, tick=tick, state_changed=_accept, start=False)
+    try:
+        for index in range(3):
+            blocked = await manager.tick_once("alice")
+            assert calls == index + 1  # no immediate retry of a blocked tick
+            assert blocked == initial  # budget exhaustion preserves prior errors
+        if recovery == "raise-cap":
+            await ledger.configure(2)
+        else:
+            moment += 86400
+        recovered = await manager.tick_once("alice")
+        assert calls == 4
+        assert recovered.status == "active"
+        assert recovered.last_ok == 1234
+        assert recovered.last_error is None
+        assert recovered.consecutive_errors == 0
+    finally:
+        await manager.cancel_all()
+        manager.release_executor()
+
+
+async def test_daily_budget_on_retry_does_not_increase_existing_failures(tmp_path: Path) -> None:
+    from insto.exceptions import DailyBudgetReached
+
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise Transient("network failure before the cap was exhausted")
+        raise DailyBudgetReached()
+
+    initial = _spec(last_ok=1000, last_error="earlier failure", consecutive_errors=1)
+    manager.add(initial, tick=tick, state_changed=_accept, start=False)
+    try:
+        assert await manager.tick_once("alice") == initial
+        assert calls == 2
+    finally:
+        await manager.cancel_all()
+        manager.release_executor()
+
+
+async def test_hard_failure_pauses_without_retry(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+        raise Banned("account suspended")
+
+    manager.add(_spec(), tick=tick, state_changed=_accept, start=False)
+    updated = await manager.tick_once("alice")
+
+    assert calls == 1
+    assert updated.status == "paused"
+    assert "suspended" in (updated.last_error or "")
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+async def test_false_state_callback_stops_stale_loop(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    callback_seen = asyncio.Event()
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+
+    async def stale(_: WatchSpec) -> bool:
+        callback_seen.set()
+        return False
+
+    manager.add(_spec(interval=1), tick=tick, state_changed=stale, initial_delay=0)
+    await asyncio.wait_for(callback_seen.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+    assert calls == 1
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+async def test_callback_exception_reports_fatal_error(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    failure = RuntimeError("sqlite failed")
+
+    async def tick() -> None:
+        return None
+
+    async def broken(_: WatchSpec) -> bool:
+        raise failure
+
+    manager.add(_spec(interval=1), tick=tick, state_changed=broken, initial_delay=0)
+    reported = await asyncio.wait_for(manager.fatal_error, timeout=1)
+    assert reported is failure
+    await manager.cancel_all()
+    manager.release_executor()
+
+
+async def test_cancel_all_drains_in_flight_tick_before_repl_release(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, release_when_empty=True)
+    manager.acquire_executor()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def tick() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            finished.set()
+
+    manager.add(_spec(), tick=tick, state_changed=_accept, start=False)
+    task = asyncio.create_task(manager.tick_once("alice"))
+    await started.wait()
+    await manager.cancel_all()
+
+    assert finished.is_set()
+    assert manager.executor_acquired is False
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_daemon_cancel_all_retains_lock_until_explicit_release(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, release_when_empty=False)
+    manager.acquire_executor()
+    await manager.cancel_all()
+    assert manager.executor_acquired is True
+    manager.release_executor()
+    assert manager.executor_acquired is False
+
+
+@pytest.mark.parametrize("first_operation", ["remove", "cancel_all"])
+async def test_concurrent_drains_keep_executor_until_tick_cleanup_finishes(
+    tmp_path: Path, first_operation: str
+) -> None:
+    manager = _manager(tmp_path, release_when_empty=True)
+    manager.acquire_executor()
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def tick() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            cleanup_finished.set()
+
+    manager.add(_spec(), tick=tick, state_changed=_accept, initial_delay=0)
+    await asyncio.wait_for(started.wait(), timeout=1)
+    first = asyncio.create_task(
+        manager.remove("alice") if first_operation == "remove" else manager.cancel_all()
+    )
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    second = asyncio.create_task(manager.cancel_all())
+    contender = WatchProcessLock(tmp_path / "store.db")
+    try:
+        done, _ = await asyncio.wait({second}, timeout=0.02)
+        assert not done, "a concurrent drain must join the in-flight cleanup"
+        assert not cleanup_finished.is_set()
+        with pytest.raises(WatchLockBusyError):
+            contender.acquire()
+        with pytest.raises(WatchError, match="tasks remain"):
+            manager.release_executor()
+    finally:
+        contender.release()
+        finish_cleanup.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert cleanup_finished.is_set()
+    contender.acquire()
+    contender.release()
+
+
+async def test_cancelled_remove_can_be_drained_without_recancelling_tick(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, release_when_empty=True)
+    manager.acquire_executor()
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def tick() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            cleanup_finished.set()
+
+    manager.add(_spec(), tick=tick, state_changed=_accept, initial_delay=0)
+    await asyncio.wait_for(started.wait(), timeout=1)
+    removing = asyncio.create_task(manager.remove("alice"))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    removing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await removing
+    draining = asyncio.create_task(manager.cancel_all())
+    try:
+        done, _ = await asyncio.wait({draining}, timeout=0.02)
+        assert not done
+        assert manager.executor_acquired
+    finally:
+        finish_cleanup.set()
+        await asyncio.wait_for(draining, timeout=1)
+    assert cleanup_finished.is_set()
+    assert not manager.executor_acquired
+
+
+async def test_slow_tick_never_overlaps_or_queues_catch_up(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    manager.acquire_executor()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal active, calls, peak
+        calls += 1
+        active += 1
+        peak = max(peak, active)
+        started.set()
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+
+    manager.add(_spec(interval=1), tick=tick, state_changed=_accept, initial_delay=0)
+    await started.wait()
+    await asyncio.sleep(0.02)
+    assert calls == 1
+    assert peak == 1
+    release.set()
+    await asyncio.sleep(0.02)
+    assert calls == 1
+    await manager.cancel_all()
+    manager.release_executor()

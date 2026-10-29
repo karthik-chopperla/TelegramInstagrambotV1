@@ -1,0 +1,891 @@
+"""sqlite-backed history, snapshot, and watch store.
+
+A single `sqlite3.Connection` lives on the `HistoryStore` for the whole
+session. The connection is opened with `check_same_thread=False` so that
+async wrappers can run statements through `asyncio.to_thread(...)` without
+hitting the default thread-affinity check; a `threading.Lock` serialises
+the actual cursor work so the connection itself is never touched
+concurrently.
+
+Three tables hold session state:
+
+- `cli_history(cmd, target, ts)` — every command issued in REPL or CLI
+  mode, used by the welcome screen ("recent targets") and the `/history`
+  command. Pruned to 90 days.
+- `watches(user, registration_id, interval_seconds, last_ok, last_error,
+  consecutive_errors, status)` — every registered `/watch <user>`; mirror of
+  `WatchSpec`. CRUD only — execution and SQLite reconciliation live in
+  `service/watch.py` and `service/watch_daemon.py`.
+- `snapshots(target_pk, captured_at, profile_fields_json, last_post_pks_json,
+  avatar_url_hash, banner_url_hash)` — periodic copies of profile state for
+  diffing renames / bio edits / pfp swaps. Pruned to 30 days *and* a max of
+  100 rows per target_pk.
+
+A `_meta(key, value)` table carries `schema_version` and the daemon's
+`first_check_attempted:<user>` markers (see `watch_daemon`). It is a generic
+key/value store created in every schema version, so a marker needs no column and
+no migration. Ordered entries in
+`_MIGRATIONS` advance older stores to `_SCHEMA_VERSION`. Migration runs under
+`BEGIN IMMEDIATE` so a second insto process attempting the same migration
+blocks on the SQLite write lock and then re-checks the version (no-op
+if already migrated).
+
+Retention `prune()` runs in a worker thread on REPL startup and at daemon
+startup plus hourly. The REPL's background task never blocks the welcome screen.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, TypeVar
+from urllib.parse import urlsplit
+
+from insto.exceptions import BackendError
+from insto.models import Profile, Snapshot, WatchRegistration, WatchSpec, WatchStatus
+from insto.service.watch_registry import register_in_transaction
+
+_SCHEMA_VERSION = 2
+
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        "ALTER TABLE watches RENAME TO watches_v1",
+        """
+        CREATE TABLE watches (
+            user TEXT PRIMARY KEY,
+            registration_id TEXT NOT NULL UNIQUE,
+            interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 300),
+            last_ok INTEGER,
+            last_error TEXT,
+            consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK(consecutive_errors >= 0),
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused'))
+        )
+        """,
+        """
+        INSERT INTO watches(
+            user, registration_id, interval_seconds, last_ok, last_error,
+            consecutive_errors, status
+        )
+        SELECT canonical_user, lower(hex(randomblob(16))), interval_seconds,
+               last_ok, last_error, 0, status
+        FROM (
+            SELECT lower(ltrim(user, '@')) AS canonical_user,
+                   max(interval_seconds, 300) AS interval_seconds,
+                   last_ok,
+                   last_error,
+                   CASE WHEN status IN ('active', 'paused') THEN status ELSE 'active' END AS status,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY lower(ltrim(user, '@'))
+                       ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                                COALESCE(last_ok, -1) DESC,
+                                user ASC
+                   ) AS canonical_rank
+            FROM watches_v1
+        )
+        WHERE canonical_rank = 1
+        """,
+        "DROP TABLE watches_v1",
+    )
+}
+
+_LOCK_RETRY_DELAYS_MS: tuple[int, ...] = (100, 250, 500)
+
+CLI_HISTORY_RETENTION_DAYS = 90
+SNAPSHOT_RETENTION_DAYS = 30
+SNAPSHOT_MAX_PER_TARGET = 100
+
+# `_meta` key prefix for "the daemon already granted this user an immediate first
+# check". It is deliberately not a schema column: `_meta` is a generic key/value
+# table present in every schema version, so this records no migration and leaves
+# `schema_version` where the pinned desktop protocol expects it.
+_FIRST_CHECK_KEY = "first_check_attempted:"
+
+# Which algorithm produced a row's `avatar_url_hash` / `banner_url_hash`.
+# 1 (never written: it is the absence of the key) is the sha256 of the whole
+# signed CDN URL; 2 is the sha256 of the media identity (see `hash_url`). The
+# value is a per-row sentinel kept inside the existing `profile_fields_json`
+# payload, so it needs no column, no `_meta` key and no migration, and
+# `schema_version` stays where the pinned desktop protocol expects it.
+#
+# Per row rather than one moment per store on purpose: this very version is on
+# PyPI as 0.7.22, and an older CLI pointed at the same `~/.insto/store.db` keeps
+# writing whole-URL digests after the upgrade. A timestamp would call those rows
+# comparable; a sentinel the old writer does not know about cannot.
+#
+# It never reaches a reader: every consumer of `profile_fields` iterates
+# `_PROFILE_TRACKED_FIELDS`, and the read-only record validator skips (rather
+# than rejects) keys outside that tuple — in this version and in 0.7.22
+# — so an older insto reading a newer row ignores it.
+MEDIA_HASH_ALGO_FIELD = "_media_hash_algo"
+MEDIA_HASH_ALGO = 2
+
+_MEDIA_URL_SCHEMES = frozenset({"http", "https"})
+
+_PROFILE_TRACKED_FIELDS: tuple[str, ...] = (
+    "username",
+    "full_name",
+    "biography",
+    "external_url",
+    "is_verified",
+    "is_business",
+    "is_private",
+    "follower_count",
+    "following_count",
+    "media_count",
+    "public_email",
+    "public_phone",
+    "business_category",
+)
+
+T = TypeVar("T")
+_WATCH_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]+$")
+
+
+class _Unchanged:
+    __slots__ = ()
+
+
+UNCHANGED = _Unchanged()
+
+
+def _media_identity(url: str) -> str:
+    """Return the part of `url` that identifies the media itself.
+
+    Instagram serves one picture from a rotating edge host
+    (`scontent-lax3-2.cdninstagram.com`, `instagram.f…fbcdn.net`) with signed,
+    per-response query parameters (`oh`, `oe`, `_nc_ohc`, `_nc_ht`, `_nc_gid`,
+    `stp`, …). A real avatar URL looks like
+
+        https://scontent-lax3-2.cdninstagram.com
+            /v/t51.82787-19/550891366_18667771684001321_1383210656577177067_n.jpg
+            ?stp=dst-jpg_e0_s150x150_tt6&…&oh=00_Af08…&oe=69F70B27
+
+    where only the last path segment names the image: the size variant lives in
+    the query (`s150x150` inside `stp`) or, in older shapes, in an extra path
+    segment (`/s150x150/`), and the bucket segment (`t51.2885-19` →
+    `t51.82787-19`) is migrated server-side. The final segment survives all of
+    that, so it is the identity.
+
+    What this does *not* claim: both mappers fall back from `profile_pic_url_hd`
+    to `profile_pic_url`, and there is no captured pair of those two fields to
+    show whether they share a file name. If a flip between them ever changes the
+    final segment it costs one false `avatar` change per flip, not one per check
+    — the repository's own fixtures (`tests/fixtures/hiker/profile_public.json`)
+    model the two as `avatar.jpg` and `avatar_hd.jpg`, i.e. as differing. Do not
+    narrow this to an upload-id prefix without a real pair to test against.
+
+    Anything that is not an http(s) URL with a non-empty path is returned whole,
+    which keeps the pre-existing behaviour for unparsable input.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if parts.scheme.lower() not in _MEDIA_URL_SCHEMES:
+        return url
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if not segments:
+        return url
+    return segments[-1]
+
+
+def hash_url(url: str | None) -> str | None:
+    """Return a stable sha256 hex digest for a media URL (None if None/empty).
+
+    The digest covers `_media_identity(url)`, not the URL, so the same picture
+    fetched an hour later through another edge host with fresh signed query
+    parameters hashes the same. The name is kept because it is the module's
+    public helper and `avatar_url_hash` / `banner_url_hash` still hold a
+    64-character lowercase sha256 hex digest, the shape the read-only record
+    validator enforces.
+    """
+    if not url:
+        return None
+    return hashlib.sha256(_media_identity(url).encode("utf-8")).hexdigest()
+
+
+def media_hashes_stable(profile_fields: Mapping[str, Any]) -> bool:
+    """True when a snapshot's avatar/banner hashes use the current identity.
+
+    A row without the sentinel was written by an insto that hashed the whole
+    signed CDN URL. Those digests cannot be recomputed (the URLs are not
+    stored), so a difference against them says nothing about the picture.
+    `type(value) is int` also rejects a `True` that would otherwise compare
+    equal to 1.
+    """
+    value = profile_fields.get(MEDIA_HASH_ALGO_FIELD)
+    return type(value) is int and value == MEDIA_HASH_ALGO
+
+
+def media_hashes_comparable(
+    older_fields: Mapping[str, Any],
+    newer_fields: Mapping[str, Any],
+) -> bool:
+    """True when two snapshots may have their avatar/banner hashes compared.
+
+    Both sides must carry the current algorithm — including the newer one,
+    because an older insto sharing the same store keeps writing whole-URL
+    digests after the upgrade, and such a row can be the newer of a pair.
+    """
+    return media_hashes_stable(older_fields) and media_hashes_stable(newer_fields)
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _with_lock_retry(func: Callable[[], T]) -> T:
+    """Run `func` and retry on `database is locked` with backoff 100/250/500 ms.
+
+    Falls through with `BackendError` if all retries are exhausted, so the
+    caller sees a single readable message rather than a sqlite traceback.
+    """
+    last_exc: sqlite3.OperationalError | None = None
+    for delay_ms in (0, *_LOCK_RETRY_DELAYS_MS):
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
+        try:
+            return func()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+    raise BackendError("sqlite is locked — another insto session running?") from last_exc
+
+
+class HistoryStore:
+    """sqlite-backed history / snapshot / watch store.
+
+    Construct once per session and reuse. `close()` releases the underlying
+    connection; the instance becomes unusable afterwards. The store is
+    thread-safe in the sense that all calls serialise through a single
+    `threading.Lock`. Modest cross-process writes are coordinated by SQLite
+    transactions plus the `_with_lock_retry` backoff.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+        self._lock = threading.Lock()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the connection-level busy timeout short so a contended write
+        # falls through to `_with_lock_retry`'s application-level backoff
+        # (100/250/500ms) quickly. With the previous 5s, the per-attempt
+        # busy wait stacked on top of three retries to a worst case of >20s
+        # — long enough to feel like a hang in interactive use.
+        self._conn = sqlite3.connect(
+            str(db_path),
+            check_same_thread=False,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            with contextlib.suppress(OSError):
+                os.chmod(db_path, 0o600)
+            self._init_schema()
+            self._migrate_to_latest()
+        except BaseException:
+            self._conn.close()
+            raise
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS _meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cli_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cmd TEXT NOT NULL,
+                    target TEXT,
+                    ts INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_history_ts
+                    ON cli_history(ts);
+
+                CREATE TABLE IF NOT EXISTS watches (
+                    user TEXT PRIMARY KEY,
+                    registration_id TEXT NOT NULL UNIQUE,
+                    interval_seconds INTEGER NOT NULL CHECK(interval_seconds >= 300),
+                    last_ok INTEGER,
+                    last_error TEXT,
+                    consecutive_errors INTEGER NOT NULL DEFAULT 0
+                        CHECK(consecutive_errors >= 0),
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active', 'paused'))
+                );
+
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_pk TEXT NOT NULL,
+                    captured_at INTEGER NOT NULL,
+                    profile_fields_json TEXT NOT NULL,
+                    last_post_pks_json TEXT NOT NULL,
+                    avatar_url_hash TEXT,
+                    banner_url_hash TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshots_target_ts
+                    ON snapshots(target_pk, captured_at);
+                """
+            )
+
+    def _migrate_to_latest(self) -> None:
+        def _do() -> None:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                try:
+                    row = cur.execute(
+                        "SELECT value FROM _meta WHERE key = 'schema_version'"
+                    ).fetchone()
+                    current = int(row["value"]) if row is not None else None
+                    if current is None:
+                        cur.execute(
+                            "INSERT INTO _meta(key, value) VALUES('schema_version', ?)",
+                            (str(_SCHEMA_VERSION),),
+                        )
+                    elif current < _SCHEMA_VERSION:
+                        for v in range(current + 1, _SCHEMA_VERSION + 1):
+                            statements = _MIGRATIONS.get(v)
+                            if statements is None:
+                                raise BackendError(f"missing migration for schema version {v}")
+                            for statement in statements:
+                                cur.execute(statement)
+                        cur.execute(
+                            "UPDATE _meta SET value = ? WHERE key = 'schema_version'",
+                            (str(_SCHEMA_VERSION),),
+                        )
+                    cur.execute("COMMIT")
+                except Exception:
+                    cur.execute("ROLLBACK")
+                    raise
+
+        _with_lock_retry(_do)
+
+    def schema_version(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM _meta WHERE key = 'schema_version'"
+            ).fetchone()
+            return int(row["value"]) if row is not None else 0
+
+    # ------------------------------------------------------------------ history
+
+    def record_command(self, cmd: str, target: str | None) -> None:
+        def _do() -> None:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO cli_history(cmd, target, ts) VALUES(?, ?, ?)",
+                    (cmd, target, _now_ts()),
+                )
+
+        _with_lock_retry(_do)
+
+    async def record_command_async(self, cmd: str, target: str | None) -> None:
+        await asyncio.to_thread(self.record_command, cmd, target)
+
+    def recent_targets(self, n: int = 5) -> list[str]:
+        """Return the most recent N distinct non-null targets, newest first.
+
+        Aggregates in SQL (`GROUP BY ... ORDER BY MAX(ts) DESC LIMIT n`) so a
+        90-day cli_history retention window is not pulled into Python on every
+        welcome banner render.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT target FROM cli_history
+                WHERE target IS NOT NULL AND target != ''
+                GROUP BY target
+                ORDER BY MAX(ts) DESC, MAX(rowid) DESC
+                LIMIT ?
+                """,
+                (n,),
+            ).fetchall()
+        return [row["target"] for row in rows]
+
+    async def recent_targets_async(self, n: int = 5) -> list[str]:
+        return await asyncio.to_thread(self.recent_targets, n)
+
+    def recent_commands(self, n: int = 25) -> list[dict[str, Any]]:
+        """Return the last `n` cli_history rows, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT cmd, target, ts FROM cli_history ORDER BY ts DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+        return [{"cmd": r["cmd"], "target": r["target"], "ts": r["ts"]} for r in rows]
+
+    async def recent_commands_async(self, n: int = 25) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.recent_commands, n)
+
+    # ---------------------------------------------------------------- snapshots
+
+    def add_snapshot(self, snapshot: Snapshot) -> None:
+        def _do() -> None:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO snapshots(
+                        target_pk, captured_at, profile_fields_json,
+                        last_post_pks_json, avatar_url_hash, banner_url_hash
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.target_pk,
+                        snapshot.captured_at,
+                        json.dumps(snapshot.profile_fields, ensure_ascii=False),
+                        json.dumps(snapshot.last_post_pks),
+                        snapshot.avatar_url_hash,
+                        snapshot.banner_url_hash,
+                    ),
+                )
+
+        _with_lock_retry(_do)
+
+    async def add_snapshot_async(self, snapshot: Snapshot) -> None:
+        await asyncio.to_thread(self.add_snapshot, snapshot)
+
+    def last_snapshot(self, target_pk: str) -> Snapshot | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT target_pk, captured_at, profile_fields_json,
+                       last_post_pks_json, avatar_url_hash, banner_url_hash
+                FROM snapshots
+                WHERE target_pk = ?
+                ORDER BY captured_at DESC
+                LIMIT 1
+                """,
+                (target_pk,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Snapshot(
+            target_pk=row["target_pk"],
+            captured_at=row["captured_at"],
+            profile_fields=json.loads(row["profile_fields_json"]),
+            last_post_pks=list(json.loads(row["last_post_pks_json"])),
+            avatar_url_hash=row["avatar_url_hash"],
+            banner_url_hash=row["banner_url_hash"],
+        )
+
+    def _all_snapshot_usernames(self, target_pk: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT profile_fields_json FROM snapshots
+                WHERE target_pk = ?
+                ORDER BY captured_at ASC
+                """,
+                (target_pk,),
+            ).fetchall()
+        names: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                fields = json.loads(row["profile_fields_json"])
+            except (TypeError, ValueError):
+                continue
+            name = fields.get("username") if isinstance(fields, dict) else None
+            if isinstance(name, str) and name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    def diff(self, target_pk: str, current: Profile) -> dict[str, Any]:
+        """Compare `current` against the most recent snapshot.
+
+        Returns a dict with `first_seen` (bool), `changes` (field -> {old,new}),
+        and `previous_usernames` (every distinct historical username for
+        `target_pk` that does not equal `current.username`, oldest first).
+
+        `avatar` / `banner` are reported only when the stored snapshot carries
+        the current media-hash algorithm (see `media_hashes_stable`); otherwise
+        the pair is silently not comparable rather than a change on every check.
+        """
+        last = self.last_snapshot(target_pk)
+        prior_names = [n for n in self._all_snapshot_usernames(target_pk) if n != current.username]
+        if last is None:
+            return {
+                "first_seen": True,
+                "changes": {},
+                "previous_usernames": prior_names,
+            }
+        changes: dict[str, dict[str, Any]] = {}
+        for f in _PROFILE_TRACKED_FIELDS:
+            old = last.profile_fields.get(f)
+            new = getattr(current, f)
+            if old != new:
+                changes[f] = {"old": old, "new": new}
+        # `current` is hashed here and now, so the live side always carries the
+        # current algorithm; only the stored row can be an older writer's. When
+        # it is, the pair is not comparable and neither key is reported — a
+        # whole-URL digest differs from a media-identity digest for reasons that
+        # have nothing to do with the picture.
+        if media_hashes_stable(last.profile_fields):
+            cur_avatar = current.avatar_url_hash or hash_url(current.avatar_url)
+            cur_banner = current.banner_url_hash or hash_url(current.banner_url)
+            if last.avatar_url_hash != cur_avatar:
+                changes["avatar"] = {"old": last.avatar_url_hash, "new": cur_avatar}
+            if last.banner_url_hash != cur_banner:
+                changes["banner"] = {"old": last.banner_url_hash, "new": cur_banner}
+        return {
+            "first_seen": False,
+            "changes": changes,
+            "previous_usernames": prior_names,
+        }
+
+    def snapshot_from_profile(self, profile: Profile, post_pks: list[str]) -> Snapshot:
+        """Build a `Snapshot` from `profile` ready for `add_snapshot`."""
+        fields: dict[str, Any] = {}
+        for f in _PROFILE_TRACKED_FIELDS:
+            value = getattr(profile, f)
+            fields[f] = value
+        # Which algorithm hashed the two URLs below. Not a tracked field, so no
+        # reader ever surfaces it; see `MEDIA_HASH_ALGO_FIELD`.
+        fields[MEDIA_HASH_ALGO_FIELD] = MEDIA_HASH_ALGO
+        return Snapshot(
+            target_pk=profile.pk,
+            captured_at=_now_ts(),
+            profile_fields=fields,
+            last_post_pks=list(post_pks),
+            avatar_url_hash=profile.avatar_url_hash or hash_url(profile.avatar_url),
+            banner_url_hash=profile.banner_url_hash or hash_url(profile.banner_url),
+        )
+
+    # ------------------------------------------------------------------ watches
+
+    def register_watch(self, user: str, interval_seconds: int) -> WatchRegistration:
+        """Atomically create/reactivate a canonical watch within the global cap."""
+        canonical = _canonical_watch_user(user)
+        if interval_seconds < 300:
+            raise ValueError(
+                f"watch interval must be at least 300 seconds (got {interval_seconds})"
+            )
+
+        def _do() -> WatchRegistration:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    kind, row = register_in_transaction(self._conn, canonical, interval_seconds)
+                    result = WatchRegistration(kind, _row_to_watchspec(row) if row else None)
+                    self._conn.execute("COMMIT")
+                    return result
+                except BaseException:
+                    self._conn.execute("ROLLBACK")
+                    raise
+
+        return _with_lock_retry(_do)
+
+    async def register_watch_async(self, user: str, interval_seconds: int) -> WatchRegistration:
+        return await asyncio.to_thread(self.register_watch, user, interval_seconds)
+
+    def get_watch(self, user: str) -> WatchSpec | None:
+        canonical = _canonical_watch_user(user)
+        with self._lock:
+            row = self._conn.execute(
+                _WATCH_SELECT + " WHERE user = ?",
+                (canonical,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_watchspec(row)
+
+    async def get_watch_async(self, user: str) -> WatchSpec | None:
+        return await asyncio.to_thread(self.get_watch, user)
+
+    def list_watches(self) -> list[WatchSpec]:
+        with self._lock:
+            rows = self._conn.execute(_WATCH_SELECT + " ORDER BY user ASC").fetchall()
+        return [_row_to_watchspec(r) for r in rows]
+
+    async def list_watches_async(self) -> list[WatchSpec]:
+        return await asyncio.to_thread(self.list_watches)
+
+    def update_watch_state(
+        self,
+        spec: WatchSpec,
+        *,
+        last_ok: int | None | _Unchanged = UNCHANGED,
+        last_error: str | None | _Unchanged = UNCHANGED,
+        consecutive_errors: int | _Unchanged = UNCHANGED,
+        status: WatchStatus | _Unchanged = UNCHANGED,
+    ) -> bool:
+        sets: list[str] = []
+        args: list[Any] = []
+        if not isinstance(last_ok, _Unchanged):
+            sets.append("last_ok = ?")
+            args.append(last_ok)
+        if not isinstance(last_error, _Unchanged):
+            sets.append("last_error = ?")
+            args.append(last_error)
+        if not isinstance(consecutive_errors, _Unchanged):
+            if consecutive_errors < 0:
+                raise ValueError("consecutive_errors must be non-negative")
+            sets.append("consecutive_errors = ?")
+            args.append(consecutive_errors)
+        if not isinstance(status, _Unchanged):
+            if status not in ("active", "paused"):
+                raise ValueError(f"invalid watch status: {status}")
+            sets.append("status = ?")
+            args.append(status)
+        if not sets:
+            return False
+        args.extend((spec.user, spec.registration_id))
+        sql = f"UPDATE watches SET {', '.join(sets)} WHERE user = ? AND registration_id = ?"
+
+        def _do() -> int:
+            with self._lock:
+                return self._conn.execute(sql, args).rowcount
+
+        return _with_lock_retry(_do) > 0
+
+    async def update_watch_state_async(
+        self,
+        spec: WatchSpec,
+        *,
+        last_ok: int | None | _Unchanged = UNCHANGED,
+        last_error: str | None | _Unchanged = UNCHANGED,
+        consecutive_errors: int | _Unchanged = UNCHANGED,
+        status: WatchStatus | _Unchanged = UNCHANGED,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.update_watch_state,
+            spec,
+            last_ok=last_ok,
+            last_error=last_error,
+            consecutive_errors=consecutive_errors,
+            status=status,
+        )
+
+    def delete_watch(self, user: str) -> bool:
+        canonical = _canonical_watch_user(user)
+
+        def _do() -> int:
+            with self._lock:
+                cur = self._conn.execute("DELETE FROM watches WHERE user = ?", (canonical,))
+                return cur.rowcount
+
+        return _with_lock_retry(_do) > 0
+
+    async def delete_watch_async(self, user: str) -> bool:
+        return await asyncio.to_thread(self.delete_watch, user)
+
+    # -------------------------------------------------------- first-check markers
+
+    def first_check_attempts(self) -> set[str]:
+        """Users whose immediate first check the daemon has already scheduled.
+
+        The markers live in the generic `_meta` key/value table, which exists in
+        every schema version, so recording them needs no migration and leaves
+        `schema_version` alone for the pinned desktop protocol.
+        """
+        with self._lock:
+            rows = self._conn.execute("SELECT key FROM _meta").fetchall()
+        return {
+            str(row["key"]).removeprefix(_FIRST_CHECK_KEY)
+            for row in rows
+            if str(row["key"]).startswith(_FIRST_CHECK_KEY)
+        }
+
+    async def first_check_attempts_async(self) -> set[str]:
+        return await asyncio.to_thread(self.first_check_attempts)
+
+    def mark_first_check_attempted(self, user: str) -> None:
+        """Record the grant durably before a paid check is ever scheduled."""
+        canonical = _canonical_watch_user(user)
+
+        def _do() -> None:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO _meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_FIRST_CHECK_KEY + canonical, str(_now_ts())),
+                )
+
+        _with_lock_retry(_do)
+
+    async def mark_first_check_attempted_async(self, user: str) -> None:
+        await asyncio.to_thread(self.mark_first_check_attempted, user)
+
+    def forget_first_check_attempt(self, user: str) -> bool:
+        canonical = _canonical_watch_user(user)
+
+        def _do() -> int:
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM _meta WHERE key = ?", (_FIRST_CHECK_KEY + canonical,)
+                )
+                return cur.rowcount
+
+        return _with_lock_retry(_do) > 0
+
+    async def forget_first_check_attempt_async(self, user: str) -> bool:
+        return await asyncio.to_thread(self.forget_first_check_attempt, user)
+
+    # ----------------------------------------------------------------- retention
+
+    def prune(self) -> dict[str, int]:
+        """Apply retention rules. Return `{cli_history_deleted, snapshots_deleted}`."""
+        cutoff_history = _now_ts() - CLI_HISTORY_RETENTION_DAYS * 86400
+        cutoff_snapshots = _now_ts() - SNAPSHOT_RETENTION_DAYS * 86400
+
+        def _do() -> dict[str, int]:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                try:
+                    cur.execute("DELETE FROM cli_history WHERE ts < ?", (cutoff_history,))
+                    history_deleted = cur.rowcount
+                    cur.execute(
+                        "DELETE FROM snapshots WHERE captured_at < ?",
+                        (cutoff_snapshots,),
+                    )
+                    snapshots_deleted = cur.rowcount
+                    cur.execute(
+                        """
+                        DELETE FROM snapshots
+                        WHERE id IN (
+                            SELECT id FROM (
+                                SELECT id, ROW_NUMBER() OVER (
+                                    PARTITION BY target_pk ORDER BY captured_at DESC
+                                ) AS rn
+                                FROM snapshots
+                            )
+                            WHERE rn > ?
+                        )
+                        """,
+                        (SNAPSHOT_MAX_PER_TARGET,),
+                    )
+                    snapshots_deleted += cur.rowcount
+                    cur.execute("COMMIT")
+                except Exception:
+                    cur.execute("ROLLBACK")
+                    raise
+            return {
+                "cli_history_deleted": history_deleted,
+                "snapshots_deleted": snapshots_deleted,
+            }
+
+        return _with_lock_retry(_do)
+
+    async def prune_async(self) -> dict[str, int]:
+        return await asyncio.to_thread(self.prune)
+
+    # -------------------------------------------------------------------- purges
+
+    def purge_history(self) -> int:
+        def _do() -> int:
+            with self._lock:
+                cur = self._conn.execute("DELETE FROM cli_history")
+                return cur.rowcount
+
+        return _with_lock_retry(_do)
+
+    def purge_snapshots(self, user: str | None = None) -> int:
+        def _do() -> int:
+            with self._lock:
+                if user is None:
+                    cur = self._conn.execute("DELETE FROM snapshots")
+                else:
+                    # Match either the numeric pk or the captured username
+                    # — users typically know the latter.
+                    cur = self._conn.execute(
+                        "DELETE FROM snapshots WHERE target_pk = ? "
+                        "OR json_extract(profile_fields_json, '$.username') = ?",
+                        (user, user),
+                    )
+                return cur.rowcount
+
+        return _with_lock_retry(_do)
+
+
+_WATCH_SELECT = (
+    "SELECT user, registration_id, interval_seconds, last_ok, last_error, "
+    "consecutive_errors, status FROM watches"
+)
+
+
+def _canonical_watch_user(user: str) -> str:
+    canonical = user.lstrip("@").strip().lower()
+    if not canonical or not _WATCH_USERNAME_RE.fullmatch(canonical) or canonical in (".", ".."):
+        raise ValueError("invalid watch username")
+    return canonical
+
+
+def _row_to_watchspec(row: sqlite3.Row) -> WatchSpec:
+    status = row["status"] if row["status"] in ("active", "paused") else "active"
+    return WatchSpec(
+        user=row["user"],
+        registration_id=row["registration_id"],
+        interval_seconds=row["interval_seconds"],
+        last_ok=row["last_ok"],
+        last_error=row["last_error"],
+        consecutive_errors=row["consecutive_errors"],
+        status=status,  # type: ignore[arg-type]
+    )
+
+
+def read_watches_readonly(path: Path) -> list[WatchSpec] | None:
+    """Inspect an existing store without creating, migrating or chmodding it.
+
+    None means no store exists. Unsupported or unreadable stores are errors,
+    not healthy empty registries. Version and rows use one read transaction.
+    """
+    try:
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return None
+        uri = path.expanduser().absolute().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            version = connection.execute(
+                "SELECT value FROM _meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if version is None or version[0] != str(_SCHEMA_VERSION):
+                raise BackendError("unsupported watch store schema; open insto to migrate it")
+            rows = connection.execute(_WATCH_SELECT + " ORDER BY user ASC").fetchall()
+            return [_row_to_watchspec(row) for row in rows]
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        raise BackendError(
+            "cannot read watch store; check database availability and schema"
+        ) from exc
+
+
+async def read_watches_readonly_async(path: Path) -> list[WatchSpec] | None:
+    return await asyncio.to_thread(read_watches_readonly, path)
+
+
+def _profile_to_fields(profile: Profile) -> dict[str, Any]:
+    """Public accessor mirroring the diff field set, useful for tests."""
+    full = dataclasses.asdict(profile)
+    return {f: full.get(f) for f in _PROFILE_TRACKED_FIELDS}

@@ -1,0 +1,58 @@
+"""Target group: `/target`, `/current`, `/clear`.
+
+`/target <user>` sets the active session target after pre-resolving its pk
+(so a typo fails fast instead of poisoning the next command). `/current`
+reports the active target. `/clear` drops it and also evicts the cached
+pk from the facade.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+from insto.commands._base import (
+    CommandContext,
+    CommandUsageError,
+    command,
+    resolve_and_select_target,
+)
+
+
+def _add_target_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="Instagram username (with or without leading @)",
+    )
+
+
+@command(
+    "target",
+    "Set the active session target (pre-resolves to validate username)",
+    add_args=_add_target_arg,
+)
+async def target_cmd(ctx: CommandContext) -> str:
+    raw = getattr(ctx.args, "target", None)
+    if not raw:
+        raise CommandUsageError("usage: /target <username>")
+    # Strip/validate/resolve/set is shared with REPL startup (`insto @user`).
+    return await resolve_and_select_target(ctx.facade, ctx.session, str(raw))
+
+
+@command("current", "Show the active session target")
+async def current_cmd(ctx: CommandContext) -> str | None:
+    target = ctx.session.target
+    ctx.print(f"target: @{target}" if target else "target: (none)")
+    return target
+
+
+@command("clear", "Clear the active session target")
+async def clear_cmd(ctx: CommandContext) -> None:
+    name = ctx.session.target
+    ctx.session.clear()
+    ctx.facade.clear_target_cache(name)
+    ctx.print(f"cleared target @{name}" if name else "no active target")
+    return None
+
+
+__all__ = ["clear_cmd", "current_cmd", "target_cmd"]

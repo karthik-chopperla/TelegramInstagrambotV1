@@ -1,0 +1,688 @@
+"""`OsintFacade` — single entry point for the command layer.
+
+Commands talk only to the facade; the facade composes backend +
+analytics + exporter + history + CDN-streamer into thin per-command
+methods. Each method here is intentionally 5-15 lines: if a method
+grows past that, the business logic belongs in `analytics.py` or
+`history.py`, not in the facade.
+
+Two kinds of state live on the facade for the lifetime of a session:
+
+- `backend`, `history`, `config` — concrete dependencies wired by the
+  caller (CLI / REPL bootstrap).
+- `_pk_cache` — `username -> pk` cache so a single REPL session never
+  re-resolves the active target. The cache is cleared by `clear_target`
+  (or by handing in a different `target`).
+
+CDN downloads (`download_propic`, `download_post_media`,
+`download_story`, `download_highlight_item`) live on the facade — the
+command layer never imports `_cdn` directly. Each download method
+returns the path actually written so the command can render it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import re
+import sqlite3
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Any, Literal
+
+import httpx
+
+from insto.backends._base import OSINTBackend
+from insto.backends._cdn import DEFAULT_BYTE_BUDGET as CDN_PER_RESOURCE_BUDGET
+from insto.backends._cdn import stream_to_file
+from insto.config import Config
+from insto.exceptions import BackendError
+from insto.models import (
+    Comment,
+    DirectMessage,
+    DirectThread,
+    Highlight,
+    HighlightItem,
+    Place,
+    Post,
+    Profile,
+    Quota,
+    SavedCollection,
+    Story,
+    User,
+)
+from insto.service import analytics
+from insto.service.exporter import (
+    default_export_path,
+    to_csv,
+    to_json,
+    to_maltego_csv,
+)
+from insto.service.history import HistoryStore
+from insto.service.watch import WatchManager
+from insto.service.watch_lock import WatchProcessLock
+
+if TYPE_CHECKING:
+    from insto.service.watch_daemon import WatchDaemon
+
+WatchRuntimeRole = Literal["oneshot", "repl", "daemon"]
+
+
+class OsintFacade:
+    """Stateful facade composing backend + service helpers for one session."""
+
+    # Spec §12: 5 GB cap on the total bytes a single command run may stream
+    # from the CDN (on top of the per-resource 500 MB budget enforced inside
+    # `_cdn.stream_to_file`). Reset by `dispatch()` before each command.
+    DEFAULT_COMMAND_BYTE_BUDGET: int = 5 * 1024 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        backend: OSINTBackend,
+        history: HistoryStore,
+        config: Config,
+        cdn_client: httpx.AsyncClient | None = None,
+        watches: WatchManager | None = None,
+        watch_role: WatchRuntimeRole = "repl",
+    ) -> None:
+        self.backend = backend
+        self.history = history
+        self.config = config
+        self._cdn_client = cdn_client
+        self._pk_cache: dict[str, str] = {}
+        self.watches = (
+            watches
+            if watches is not None
+            else WatchManager(WatchProcessLock(history.path), release_when_empty=True)
+        )
+        self.watch_role = watch_role
+        self.watch_daemon: WatchDaemon | None = None
+        self._command_byte_budget: int = self.DEFAULT_COMMAND_BYTE_BUDGET
+        self._command_bytes_used: int = 0
+        self._budget_lock = asyncio.Lock()
+
+    def reset_command_budget(self, total: int | None = None) -> None:
+        """Start a fresh per-command CDN byte budget.
+
+        Called from `dispatch()` once per command. Subsequent CDN downloads
+        are tracked against this budget; exceeding it raises `BackendError`
+        from the next `_stream` call.
+        """
+        self._command_byte_budget = total if total is not None else self.DEFAULT_COMMAND_BYTE_BUDGET
+        self._command_bytes_used = 0
+
+    @property
+    def command_bytes_remaining(self) -> int:
+        return max(0, self._command_byte_budget - self._command_bytes_used)
+
+    @property
+    def db_connection(self) -> sqlite3.Connection:
+        """Underlying sqlite connection — exposed for `/health` only."""
+        return self.history._conn  # by design, single-conn-per-session
+
+    # --------------------------------------------------------------- target
+
+    async def resolve_pk(self, username: str) -> str:
+        """Return `pk` for `username`, caching for the session."""
+        cleaned = username.lstrip("@")
+        cached = self._pk_cache.get(cleaned)
+        if cached is not None:
+            return cached
+        pk = await self.backend.resolve_target(cleaned)
+        self._pk_cache[cleaned] = pk
+        return pk
+
+    def clear_target_cache(self, username: str | None = None) -> None:
+        """Drop `username` from the pk cache (or the whole cache if None)."""
+        if username is None:
+            self._pk_cache.clear()
+        else:
+            self._pk_cache.pop(username.lstrip("@"), None)
+
+    # --------------------------------------------------------------- profile
+
+    async def profile_info(self, username: str) -> tuple[Profile, dict[str, Any]]:
+        """Fetch full `Profile` plus `user_about` payload."""
+        pk = await self.resolve_pk(username)
+        profile = await self.backend.get_profile(pk)
+        about = await self.backend.get_user_about(pk)
+        return profile, about
+
+    async def profile(self, username: str) -> Profile:
+        """Fetch only the `Profile` DTO (no `user_about`)."""
+        pk = await self.resolve_pk(username)
+        return await self.backend.get_profile(pk)
+
+    # ----------------------------------------------------------------- media
+
+    async def user_posts(self, username: str, *, limit: int = 12) -> list[Post]:
+        pk = await self.resolve_pk(username)
+        return [p async for p in self.backend.iter_user_posts(pk, limit=limit)]
+
+    async def user_tagged(self, username: str, *, limit: int = 12) -> list[Post]:
+        pk = await self.resolve_pk(username)
+        return [p async for p in self.backend.iter_user_tagged(pk, limit=limit)]
+
+    async def user_stories(self, username: str, *, limit: int | None = None) -> list[Story]:
+        pk = await self.resolve_pk(username)
+        return [s async for s in self.backend.iter_user_stories(pk, limit=limit)]
+
+    async def user_highlights(self, username: str, *, limit: int | None = None) -> list[Highlight]:
+        pk = await self.resolve_pk(username)
+        return [h async for h in self.backend.iter_user_highlights(pk, limit=limit)]
+
+    async def highlight_items(
+        self, highlight_id: str, *, limit: int | None = None
+    ) -> list[HighlightItem]:
+        return [i async for i in self.backend.iter_highlight_items(highlight_id, limit=limit)]
+
+    # --------------------------------------------------------------- network
+
+    async def followers(self, username: str, *, limit: int = 50) -> list[User]:
+        pk = await self.resolve_pk(username)
+        return [u async for u in self.backend.iter_user_followers(pk, limit=limit)]
+
+    async def followings(self, username: str, *, limit: int = 50) -> list[User]:
+        pk = await self.resolve_pk(username)
+        return [u async for u in self.backend.iter_user_following(pk, limit=limit)]
+
+    async def similar(self, username: str) -> list[User]:
+        pk = await self.resolve_pk(username)
+        return await self.backend.get_suggested(pk)
+
+    async def timeline(self, username: str, *, limit: int = 50) -> analytics.TimelineResult:
+        """Posting cadence (hour-of-day + day-of-week) over the last N posts."""
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.compute_timeline(posts, target=username, limit=limit)
+
+    async def where(
+        self, username: str, *, limit: int = 50, top: int = 10
+    ) -> analytics.GeoFingerprintResult:
+        """Geo-fingerprint: anchor place + centroid + top places from posts."""
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.compute_geo_fingerprint(posts, target=username, limit=limit, top=top)
+
+    async def intersect(
+        self,
+        username_a: str,
+        username_b: str,
+        *,
+        window: int = 1000,
+    ) -> analytics.IntersectionResult:
+        """Followers(@a) ∩ followers(@b), capped at ``window`` per side.
+
+        Both follower fetches run concurrently — they hit different
+        pks so the backend can serve them in parallel. Output is the
+        list of users who follow *both* targets, useful OSINT signal
+        for "shared community" investigations.
+        """
+        pk_a, pk_b = await asyncio.gather(
+            self.resolve_pk(username_a),
+            self.resolve_pk(username_b),
+        )
+
+        async def _collect(pk: str) -> list[User]:
+            return [u async for u in self.backend.iter_user_followers(pk, limit=window)]
+
+        followers_a, followers_b = await asyncio.gather(_collect(pk_a), _collect(pk_b))
+        return analytics.compute_intersection(
+            followers_a,
+            followers_b,
+            target_a=username_a,
+            target_b=username_b,
+            window=window,
+        )
+
+    async def user_pinned(self, username: str, *, limit: int = 12) -> list[Post]:
+        """Pinned posts of @username (Instagram allows up to 3)."""
+        pk = await self.resolve_pk(username)
+        return [p async for p in self.backend.iter_user_pinned(pk, limit=limit)]
+
+    async def user_reposts(self, username: str, *, limit: int = 50) -> list[Post]:
+        """Posts the target has reposted (IG repost surface)."""
+        pk = await self.resolve_pk(username)
+        return [p async for p in self.backend.iter_user_reposts(pk, limit=limit)]
+
+    async def post_info(self, ref: str) -> Post:
+        """Resolve a media URL / shortcode / pk to a Post DTO."""
+        return await self.backend.get_post_by_ref(ref)
+
+    async def search_places(self, query: str, *, limit: int = 20) -> list[Place]:
+        """Free-text search for IG places."""
+        return await self.backend.search_places(query, limit=limit)
+
+    async def place_posts(self, place_pk: str, *, limit: int = 50) -> list[Post]:
+        """Top posts at a given Instagram location pk."""
+        return [p async for p in self.backend.iter_place_posts(place_pk, limit=limit)]
+
+    async def search_users(self, query: str, *, limit: int = 50) -> list[User]:
+        """Free-text user search. Empty query is rejected upstream."""
+        return [u async for u in self.backend.iter_search_users(query, limit=limit)]
+
+    async def resolve_short_url(self, url: str) -> str:
+        """Resolve an Instagram short-link (or any IG-hosted redirect)
+        to its canonical URL. Needs a backend with a HEAD-on-public
+        surface (currently aiograpi only)."""
+        return await self.backend.resolve_short_url(url)
+
+    async def audio_clips(self, track_id: str, *, limit: int = 30) -> list[Post]:
+        """List clips that use a given audio asset."""
+        return [p async for p in self.backend.iter_audio_clips(track_id, limit=limit)]
+
+    async def recommended(self, username: str) -> list[User]:
+        """Fetch IG's category-based recommendations for the target."""
+        pk = await self.resolve_pk(username)
+        return await self.backend.get_recommended(pk)
+
+    async def direct_threads(self, *, limit: int = 20) -> list[DirectThread]:
+        """Read-only Direct threads for the logged-in aiograpi account."""
+        return [t async for t in self.backend.iter_direct_threads(limit=limit)]
+
+    async def direct_messages(self, thread_id: str, *, limit: int = 20) -> list[DirectMessage]:
+        """Read-only Direct messages for one thread."""
+        return [m async for m in self.backend.iter_direct_messages(thread_id, limit=limit)]
+
+    async def saved_collections(self, *, limit: int = 20) -> list[SavedCollection]:
+        """Read-only saved-media collections for the logged-in aiograpi account."""
+        return [c async for c in self.backend.iter_saved_collections(limit=limit)]
+
+    async def saved_posts(self, *, collection: str | None = None, limit: int = 20) -> list[Post]:
+        """Read-only saved media for the logged-in aiograpi account."""
+        return [p async for p in self.backend.iter_saved_posts(collection=collection, limit=limit)]
+
+    async def mutuals(
+        self, username: str, *, follower_limit: int = 1000, following_limit: int = 1000
+    ) -> analytics.MutualsResult:
+        pk = await self.resolve_pk(username)
+        followers = [u async for u in self.backend.iter_user_followers(pk, limit=follower_limit)]
+        followings = [u async for u in self.backend.iter_user_following(pk, limit=following_limit)]
+        return analytics.compute_mutuals(
+            followers,
+            followings,
+            target=username,
+            follower_limit=follower_limit,
+            following_limit=following_limit,
+        )
+
+    # ------------------------------------------------------------- analytics
+
+    async def hashtags(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.extract_hashtags(posts, target=username, limit=limit)
+
+    async def mentions(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.extract_mentions(posts, target=username, limit=limit)
+
+    async def locations(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.extract_locations(posts, target=username, limit=limit)
+
+    async def likes(self, username: str, *, limit: int = 50) -> analytics.LikesStats:
+        posts = await self.user_posts(username, limit=limit)
+        return analytics.aggregate_likes(posts, target=username, limit=limit)
+
+    # --------------------------------------------- per-post fan-out helpers
+
+    # Bounded concurrency for the per-post fan-out used by /wliked /wcommented
+    # /fans. HikerAPI's per-account rate cap is typically 7-15 rps; aiograpi
+    # rate-limits per session at a similar level. 5 concurrent calls keeps
+    # us comfortably under either ceiling while delivering ~5x wall-clock
+    # speedup over sequential.
+    _FANOUT_CONCURRENCY: int = 5
+
+    async def _gather_per_post(
+        self,
+        posts: list[Post],
+        fetch: Callable[[str], Awaitable[list[Any]]],
+        *,
+        desc: str,
+    ) -> list[Any]:
+        """Fan out ``fetch(post.pk)`` across all posts with bounded
+        concurrency, ticking a tqdm bar as each call completes.
+
+        Order of the returned items is non-deterministic — callers that
+        feed it into a ``Counter``-style aggregator (every current caller
+        does) don't care.
+        """
+        from insto.ui.progress import track
+
+        sem = asyncio.Semaphore(self._FANOUT_CONCURRENCY)
+
+        async def _bounded(pk: str) -> list[Any]:
+            async with sem:
+                return await fetch(pk)
+
+        tasks = [asyncio.create_task(_bounded(p.pk)) for p in posts]
+        merged: list[Any] = []
+        for fut in track(asyncio.as_completed(tasks), desc=desc, total=len(tasks)):
+            merged.extend(await fut)
+        return merged
+
+    async def wcommented(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        # `limit` is the *post* window only. Per-post comments are bounded by
+        # the facade default (50/post) — the same cap `/comments` aggregate
+        # mode uses — so the spec §9 bounded-window guarantee holds without
+        # `--limit` doubling as a per-post comment cap.
+        posts = await self.user_posts(username, limit=limit)
+        merged: list[Comment] = await self._gather_per_post(
+            posts, self.post_comments, desc="fetching comments"
+        )
+        return analytics.count_wcommented(merged, target=username, limit=limit)
+
+    async def wliked(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        """Top likers across the target's last `limit` posts.
+
+        Cost: 1 ``user_posts`` page + N likers calls (one per post).
+        Concurrency is bounded by ``_FANOUT_CONCURRENCY`` (default 5)
+        so a 50-post window completes in roughly the time of 10 serial
+        calls instead of 50.
+        """
+        posts = await self.user_posts(username, limit=limit)
+        merged: list[User] = await self._gather_per_post(
+            posts, self.post_likers, desc="fetching likers"
+        )
+        return analytics.count_wliked(merged, target=username, limit=limit)
+
+    async def fans(
+        self,
+        username: str,
+        *,
+        limit: int = 50,
+        comment_weight: int = 3,
+        top: int | None = 20,
+    ) -> analytics.FansResult:
+        """Top fans of @username across the last `limit` posts.
+
+        Combines likers + commenters into one weighted ranking. Both
+        fetches run concurrently across all posts (bounded by
+        ``_FANOUT_CONCURRENCY``) — the bar shows the *combined* call
+        count, ticking once per likers-or-comments completion.
+        """
+        from insto.ui.progress import track
+
+        posts = await self.user_posts(username, limit=limit)
+        sem = asyncio.Semaphore(self._FANOUT_CONCURRENCY)
+
+        # Tag the result so a single `as_completed` loop can fan back
+        # into the right destination list. ``tuple[str, list[Any]]`` is
+        # a small evil that keeps mypy happy across the union of likers
+        # and comments without two parallel as_completed loops.
+        async def _likers(pk: str) -> tuple[str, list[Any]]:
+            async with sem:
+                return "likers", list(await self.post_likers(pk))
+
+        async def _comments(pk: str) -> tuple[str, list[Any]]:
+            async with sem:
+                return "comments", list(await self.post_comments(pk))
+
+        tasks: list[asyncio.Task[tuple[str, list[Any]]]] = [
+            asyncio.create_task(_likers(p.pk)) for p in posts
+        ]
+        tasks += [asyncio.create_task(_comments(p.pk)) for p in posts]
+
+        likers: list[User] = []
+        comments: list[Comment] = []
+        for fut in track(asyncio.as_completed(tasks), desc="fetching engagement", total=len(tasks)):
+            kind, items = await fut
+            if kind == "likers":
+                likers.extend(items)
+            else:
+                comments.extend(items)
+        return analytics.count_fans(
+            likers,
+            comments,
+            target=username,
+            limit=limit,
+            analyzed_posts=len(posts),
+            comment_weight=comment_weight,
+            top=top,
+        )
+
+    async def wtagged(self, username: str, *, limit: int = 50) -> analytics.TopList:
+        pk = await self.resolve_pk(username)
+        tagged = [p async for p in self.backend.iter_user_tagged(pk, limit=limit)]
+        return analytics.count_wtagged(tagged, target=username, limit=limit)
+
+    # ---------------------------------------------------------- interactions
+
+    async def post_comments(self, media_pk: str, *, limit: int = 50) -> list[Comment]:
+        return [c async for c in self.backend.iter_post_comments(media_pk, limit=limit)]
+
+    async def post_likers(self, media_pk: str, *, limit: int = 50) -> list[User]:
+        return [u async for u in self.backend.iter_post_likers(media_pk, limit=limit)]
+
+    # --------------------------------------------------------------- hashtags
+
+    async def hashtag_posts(self, tag: str, *, limit: int = 50) -> list[Post]:
+        cleaned = tag.lstrip("#")
+        return [p async for p in self.backend.iter_hashtag_posts(cleaned, limit=limit)]
+
+    # ----------------------------------------------------------------- watch
+
+    async def snapshot(self, username: str, *, post_limit: int = 12) -> Profile:
+        """Capture a fresh snapshot for `username` and persist it."""
+        profile = await self.profile(username)
+        await self._persist_snapshot(profile, post_limit=post_limit)
+        return profile
+
+    async def diff(self, username: str) -> dict[str, Any]:
+        """Compare the current profile of `username` against last snapshot."""
+        profile = await self.profile(username)
+        return self.history.diff(profile.pk, profile)
+
+    async def diff_and_snapshot(self, username: str, *, post_limit: int = 12) -> dict[str, Any]:
+        """One-pass watch tick: fetch profile once, diff, then persist snapshot."""
+        profile = await self.profile(username)
+        diff = self.history.diff(profile.pk, profile)
+        await self._persist_snapshot(profile, post_limit=post_limit)
+        return diff
+
+    async def _persist_snapshot(self, profile: Profile, *, post_limit: int) -> None:
+        posts = await self.user_posts(profile.username, limit=post_limit)
+        snap = self.history.snapshot_from_profile(profile, [p.pk for p in posts])
+        await self.history.add_snapshot_async(snap)
+
+    # ------------------------------------------------------------------ ops
+
+    def quota(self) -> Quota:
+        return self.backend.get_quota()
+
+    def last_error(self) -> BaseException | None:
+        return self.backend.get_last_error()
+
+    # --------------------------------------------------------------- exports
+
+    def export_json(
+        self,
+        payload: Any,
+        *,
+        command: str,
+        target: str | None,
+        dest: Path | IO[bytes] | None = None,
+    ) -> Path | None:
+        """Write a versioned JSON envelope. `dest=None` → default path under `output_dir`."""
+        target_dest = (
+            dest
+            if dest is not None
+            else default_export_path(
+                command=command, target=target, ext="json", output_dir=self.config.output_dir
+            )
+        )
+        return to_json(payload, command=command, target=target, dest=target_dest)
+
+    def export_csv(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        command: str,
+        target: str | None,
+        dest: Path | IO[bytes] | None = None,
+    ) -> Path | None:
+        target_dest = (
+            dest
+            if dest is not None
+            else default_export_path(
+                command=command, target=target, ext="csv", output_dir=self.config.output_dir
+            )
+        )
+        return to_csv(rows, command=command, target=target, dest=target_dest)
+
+    def export_maltego(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        command: str,
+        entity_type: str,
+        target: str | None,
+        dest: Path | IO[bytes] | None = None,
+    ) -> Path | None:
+        """Write Maltego entity-import CSV. Default path: `<cmd>.maltego.csv`."""
+        target_dest = (
+            dest
+            if dest is not None
+            else default_export_path(
+                command=command,
+                target=target,
+                ext="maltego.csv",
+                output_dir=self.config.output_dir,
+            )
+        )
+        return to_maltego_csv(rows, entity_type=entity_type, dest=target_dest)
+
+    # -------------------------------------------------------------- downloads
+
+    async def download_propic(self, profile: Profile) -> Path | None:
+        """Download a profile's avatar into `<output>/<user>/propic/<pk>.<ext>`."""
+        if not profile.avatar_url:
+            return None
+        dest_dir = self._media_dir(profile.username, "propic")
+        return await self._stream(profile.avatar_url, dest_dir / _safe_pk(profile.pk))
+
+    async def download_post_media(
+        self, post: Post, *, dest_dir: Path | None = None
+    ) -> list[Path]:
+        """Download every media URL of `post` into a destination directory."""
+        owner = post.owner_username or "_"
+        if dest_dir is None:
+            dest_dir = self._media_dir(owner, "posts")
+        else:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        pk = _safe_pk(post.pk)
+        out: list[Path] = []
+        for idx, url in enumerate(post.media_urls):
+            base = dest_dir / (pk if idx == 0 else f"{pk}_{idx}")
+            out.append(await self._stream(url, base, taken_at=post.taken_at))
+        return out
+
+    async def download_story(self, story: Story) -> Path:
+        """Download a story into `<output>/<owner>/stories/`."""
+        owner = story.owner_username or "_"
+        dest_dir = self._media_dir(owner, "stories")
+        return await self._stream(
+            story.media_url, dest_dir / _safe_pk(story.pk), taken_at=story.taken_at
+        )
+
+    async def download_highlight_item(self, item: HighlightItem, *, owner_username: str) -> Path:
+        """Download a highlight item into `<output>/<owner>/highlights/`."""
+        dest_dir = self._media_dir(owner_username, "highlights")
+        return await self._stream(
+            item.media_url, dest_dir / _safe_pk(item.pk), taken_at=item.taken_at
+        )
+
+    def _media_dir(self, username: str, kind: str) -> Path:
+        cleaned = _safe_path_segment(username.lstrip("@")) or "_"
+        path = self.config.output_dir / cleaned / kind
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    async def _stream(
+        self,
+        url: str,
+        dest: Path,
+        *,
+        taken_at: float | int | None = None,
+    ) -> Path:
+        # Per-command byte budget (spec §12: 5 GB / command). The
+        # per-resource 500 MB cap still lives inside `_cdn.stream_to_file`.
+        # Concurrent `_stream` calls (e.g. /batch fan-out) race on the
+        # counter, so reserve pessimistically before the await and
+        # reconcile after — protected by a lock so two callers can't
+        # observe the same `remaining` and double-spend.
+        async with self._budget_lock:
+            remaining = self._command_byte_budget - self._command_bytes_used
+            if remaining <= 0:
+                raise BackendError(
+                    "command exceeded byte budget "
+                    f"{self._command_byte_budget} (used {self._command_bytes_used})"
+                )
+            reservation = min(CDN_PER_RESOURCE_BUDGET, remaining)
+            self._command_bytes_used += reservation
+        try:
+            path = await stream_to_file(
+                url,
+                dest,
+                taken_at=taken_at,
+                client=self._cdn_client,
+                byte_budget=reservation,
+            )
+        except BaseException:
+            async with self._budget_lock:
+                self._command_bytes_used -= reservation
+            raise
+        # Default to the full reservation if stat() fails: bytes were
+        # written (stream_to_file returned a path), so refunding to 0
+        # would silently disable the per-command byte budget across
+        # repeated stat failures. Pessimistic accounting is correct here.
+        actual = reservation
+        with contextlib.suppress(OSError):
+            actual = path.stat().st_size
+        async with self._budget_lock:
+            # actual ≤ reservation by construction — the streamer enforces
+            # `byte_budget=reservation` so anything larger would have raised.
+            self._command_bytes_used += actual - reservation
+        return path
+
+    # ------------------------------------------------------------------- log
+
+    async def record_command(self, cmd: str, target: str | None) -> None:
+        """Persist a single REPL/CLI invocation in the history table."""
+        await self.history.record_command_async(cmd, target)
+
+    async def aclose(self) -> None:
+        """Release backend / cdn / watch resources (history is owned by the caller)."""
+        if self.watch_daemon is not None:
+            await self.watch_daemon.stop()
+        await self.watches.cancel_all()
+        if self._cdn_client is not None:
+            await self._cdn_client.aclose()
+            self._cdn_client = None
+        with contextlib.suppress(Exception):
+            await self.backend.aclose()
+
+
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_path_segment(value: str) -> str:
+    """Return `value` if it is safe to use as a single filesystem path segment.
+
+    Defense-in-depth: backend DTO fields (e.g. `Profile.username`,
+    `Post.owner_username`, `Post.pk`) flow into `<output>/<user>/...`
+    paths. Instagram constrains usernames server-side, but the rest of the
+    codebase rejects path-meta characters at the user-input boundary; we
+    apply the same guard at the backend boundary so a hostile / drifted
+    payload can never escape `output_dir`. Returns `""` if the value is not
+    safe — the caller should substitute `_` in that case.
+    """
+    if not value or value in (".", ".."):
+        return ""
+    if not _SAFE_SEGMENT_RE.fullmatch(value):
+        return ""
+    return value
+
+
+def _safe_pk(value: str) -> str:
+    """Return a filesystem-safe pk segment, substituting `_` if drifted."""
+    return _safe_path_segment(value) or "_"
